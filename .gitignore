@@ -1,0 +1,26 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+pyvenv.cfg
+
+.tmp_py/
+Logs/
+decomp_recovery/
+
+*.duckdb
+*.db
+sportsbook_lines.csv
+
+MLB_Report_*.txt
+Sportsbook_Watchlist_*.txt
+Manual_Sportsbook_Lines_*.csv
+OPENING_DAY_READINESS_*.txt
+MLB_Season_To_Date_2026.xlsx
+
+Report Log/
+Maintenance/Scratch/
+
+*.tmp
+*.log

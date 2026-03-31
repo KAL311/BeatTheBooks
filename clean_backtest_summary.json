@@ -1,0 +1,27 @@
+{
+  "games": 164,
+  "oos_games": 59,
+  "log_loss": 0.719008704543694,
+  "accuracy": 0.5084745762711864,
+  "total_mae": 4.094831693695557,
+  "total_rmse": 4.983338632904903,
+  "margin_mae": 3.934219754302817,
+  "margin_rmse": 5.225274545570122,
+  "date_span": "2026-02-21 to 2026-03-14",
+  "oos_span": "2026-03-11 to 2026-03-14",
+  "replayed_dates": [
+    "2026-02-21",
+    "2026-02-22",
+    "2026-02-23",
+    "2026-02-24",
+    "2026-02-25",
+    "2026-03-09",
+    "2026-03-10",
+    "2026-03-11",
+    "2026-03-12",
+    "2026-03-13",
+    "2026-03-14"
+  ],
+  "output_path": "C:\\Users\\fraun\\OneDrive\\Documents\\2026 MLB Report\\clean_backtest_log.csv",
+  "source": "clean_backtest_runner"
+}

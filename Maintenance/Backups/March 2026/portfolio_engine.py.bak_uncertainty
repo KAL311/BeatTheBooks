@@ -1,0 +1,450 @@
+from __future__ import annotations
+
+import datetime as dt
+import re
+from typing import Any, Dict, List, Tuple
+
+import pandas as pd
+
+PORTFOLIO_RECOMMENDATION_COLUMNS = [
+    'run_id', 'report_date', 'phase', 'allocation_rank', 'market_type', 'selection', 'away_team', 'home_team', 'game_pk',
+    'selected_team', 'raw_units', 'demand_units', 'allocated_units', 'unallocated_units', 'expected_value_per_unit',
+    'raw_expected_value_per_unit', 'adjusted_expected_value_per_unit', 'edge_value', 'actionability_label',
+    'actionability_score', 'confidence_tier', 'priority_score', 'uncertainty_score', 'uncertainty_label',
+    'uncertainty_notes', 'uncertainty_penalty', 'risk_multiplier', 'same_game_peer_count', 'same_team_peer_count', 'same_game_cross_market_count',
+    'base_correlation_penalty', 'dynamic_correlation_penalty', 'final_correlation_penalty', 'game_exposure_after',
+    'team_exposure_after', 'portfolio_share_pct', 'cap_notes', 'market_label', 'sportsbook_count',
+]
+
+PORTFOLIO_SUMMARY_COLUMNS = [
+    'run_id', 'report_date', 'phase', 'daily_budget_units', 'raw_demand_units', 'demand_units', 'allocated_units',
+    'unallocated_units', 'utilization_pct', 'candidate_count', 'allocated_candidate_count', 'watch_count', 'bet_count',
+    'must_take_count', 'max_game_units', 'max_team_units', 'max_moneyline_units', 'max_run_line_units', 'max_total_units',
+    'base_unit_risk_pct', 'max_daily_risk_pct', 'largest_game_exposure_units', 'largest_team_exposure_units',
+    'largest_game_exposure_pct', 'largest_team_exposure_pct', 'avg_correlation_penalty', 'correlated_candidate_count',
+    'avg_uncertainty_score', 'high_uncertainty_candidate_count',
+]
+
+PORTFOLIO_EXPOSURE_COLUMNS = [
+    'run_id', 'report_date', 'phase', 'exposure_scope', 'bucket', 'allocated_units', 'raw_units', 'candidate_count',
+]
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or pd.isna(value):
+            return float(default)
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None or pd.isna(value):
+            return int(default)
+        return int(float(value))
+    except Exception:
+        return int(default)
+
+
+def portfolio_config_for_phase(phase: str) -> Dict[str, Any]:
+    phase_name = str(phase or 'spring').lower()
+    if phase_name == 'spring':
+        return {
+            'daily_budget_units': 1.75,
+            'max_game_units': 0.60,
+            'max_team_units': 0.75,
+            'market_caps': {'moneyline': 1.00, 'run_line': 0.65, 'total': 0.60},
+            'min_bet_units': 0.10,
+            'unit_risk_pct': 0.0075,
+            'same_game_penalty': 0.24,
+            'same_team_penalty': 0.18,
+            'cross_market_penalty': 0.10,
+            'dynamic_load_penalties': {'game': 0.70, 'team': 0.45, 'market': 0.20},
+        }
+    return {
+        'daily_budget_units': 3.00,
+        'max_game_units': 1.00,
+        'max_team_units': 1.25,
+        'market_caps': {'moneyline': 1.60, 'run_line': 1.00, 'total': 0.90},
+        'min_bet_units': 0.10,
+        'unit_risk_pct': 0.0100,
+        'same_game_penalty': 0.18,
+        'same_team_penalty': 0.12,
+        'cross_market_penalty': 0.08,
+        'dynamic_load_penalties': {'game': 0.55, 'team': 0.35, 'market': 0.15},
+    }
+
+
+def _selected_team(selection: str, market_type: str, away_team: str, home_team: str) -> str:
+    text = str(selection or '').strip().upper()
+    if market_type == 'moneyline':
+        return text
+    if market_type == 'run_line':
+        match = re.match(r'^([A-Z]{2,4})\s+[+-]?\d', text)
+        if match:
+            return match.group(1)
+    return ''
+
+
+def _candidate_team_keys(row: pd.Series) -> List[str]:
+    market_type = str(row.get('market_type') or '').lower()
+    away_team = str(row.get('away_team') or '')
+    home_team = str(row.get('home_team') or '')
+    selected_team = str(row.get('selected_team') or '')
+    if market_type == 'total':
+        return [team for team in [away_team, home_team] if team]
+    if selected_team:
+        return [selected_team]
+    return [team for team in [away_team, home_team] if team][:1]
+
+
+def _game_key(row: pd.Series) -> str:
+    game_pk = _safe_int(row.get('game_pk'))
+    if game_pk:
+        return f'gamepk:{game_pk}'
+    return f"{str(row.get('away_team') or '').upper()}@{str(row.get('home_team') or '').upper()}"
+
+
+def _portfolio_multiplier(row: pd.Series) -> Tuple[float, float]:
+    confidence_factor = {'LOW': 0.82, 'MEDIUM': 0.94, 'HIGH': 1.00}.get(str(row.get('confidence_tier') or 'LOW').upper(), 0.85)
+    score_factor = min(max(_safe_float(row.get('actionability_score')) / 100.0, 0.40), 1.00)
+    book_factor = min(max(0.60 + (0.20 * _safe_float(row.get('sportsbook_count'))), 0.60), 1.00)
+    model_penalty = min(max(_safe_float(row.get('uncertainty_penalty'), 1.0), 0.35), 1.00)
+    uncertainty_penalty = max(0.35, min(confidence_factor * book_factor * model_penalty, 1.00))
+    return confidence_factor * score_factor * uncertainty_penalty, uncertainty_penalty
+
+
+def _same_team_peer_count(team_keys: List[str], team_counts: Dict[str, int]) -> int:
+    if not team_keys:
+        return 0
+    return max(max(team_counts.get(team, 1) - 1, 0) for team in team_keys)
+
+
+def _base_correlation_penalty(row: pd.Series, config: Dict[str, Any]) -> float:
+    same_game = _safe_float(row.get('same_game_peer_count'))
+    same_team = _safe_float(row.get('same_team_peer_count'))
+    cross_market = _safe_float(row.get('same_game_cross_market_count'))
+    penalty = 1.0 / (
+        1.0
+        + (config['same_game_penalty'] * same_game)
+        + (config['same_team_penalty'] * same_team)
+        + (config['cross_market_penalty'] * cross_market)
+    )
+    return max(0.45, min(penalty, 1.0))
+
+
+def _dynamic_correlation_penalty(game_load: float, team_load: float, market_load: float, config: Dict[str, Any]) -> float:
+    load_penalties = config['dynamic_load_penalties']
+    penalty = 1.0 / (
+        1.0
+        + (load_penalties['game'] * max(game_load, 0.0))
+        + (load_penalties['team'] * max(team_load, 0.0))
+        + (load_penalties['market'] * max(market_load, 0.0))
+    )
+    return max(0.40, min(penalty, 1.0))
+
+
+def _build_exposure_frame(run_id: str, report_date: dt.date, phase: str, exposure_scope: str, raw_frame: pd.DataFrame, allocated_frame: pd.DataFrame) -> pd.DataFrame:
+    merged = raw_frame.merge(allocated_frame, on='bucket', how='outer').fillna({'raw_units': 0.0, 'allocated_units': 0.0, 'candidate_count': 0})
+    merged['run_id'] = run_id
+    merged['report_date'] = report_date.isoformat()
+    merged['phase'] = phase
+    merged['exposure_scope'] = exposure_scope
+    merged['candidate_count'] = merged['candidate_count'].astype(int)
+    return merged[PORTFOLIO_EXPOSURE_COLUMNS].sort_values(['allocated_units', 'raw_units', 'bucket'], ascending=[False, False, True]).reset_index(drop=True)
+
+
+def build_portfolio_plan(candidate_frame: pd.DataFrame, phase: str, run_id: str, report_date: dt.date):
+    config = portfolio_config_for_phase(phase)
+    empty_recs = pd.DataFrame(columns=PORTFOLIO_RECOMMENDATION_COLUMNS)
+    empty_summary = pd.DataFrame([{
+        'run_id': run_id,
+        'report_date': report_date.isoformat(),
+        'phase': phase,
+        'daily_budget_units': config['daily_budget_units'],
+        'raw_demand_units': 0.0,
+        'demand_units': 0.0,
+        'allocated_units': 0.0,
+        'unallocated_units': 0.0,
+        'utilization_pct': 0.0,
+        'candidate_count': 0,
+        'allocated_candidate_count': 0,
+        'watch_count': 0,
+        'bet_count': 0,
+        'must_take_count': 0,
+        'max_game_units': config['max_game_units'],
+        'max_team_units': config['max_team_units'],
+        'max_moneyline_units': config['market_caps']['moneyline'],
+        'max_run_line_units': config['market_caps']['run_line'],
+        'max_total_units': config['market_caps']['total'],
+        'base_unit_risk_pct': config['unit_risk_pct'],
+        'max_daily_risk_pct': config['daily_budget_units'] * config['unit_risk_pct'],
+        'largest_game_exposure_units': 0.0,
+        'largest_team_exposure_units': 0.0,
+        'largest_game_exposure_pct': 0.0,
+        'largest_team_exposure_pct': 0.0,
+        'avg_correlation_penalty': 0.0,
+        'correlated_candidate_count': 0,
+        'avg_uncertainty_score': 0.0,
+        'high_uncertainty_candidate_count': 0,
+    }], columns=PORTFOLIO_SUMMARY_COLUMNS)
+    empty_exposure = pd.DataFrame(columns=PORTFOLIO_EXPOSURE_COLUMNS)
+
+    if candidate_frame is None or candidate_frame.empty:
+        return empty_recs, empty_summary, empty_exposure.copy(), empty_exposure.copy(), empty_exposure.copy()
+
+    work = candidate_frame.copy()
+    work['actionability_label'] = work.get('actionability_label', pd.Series(dtype=str)).astype(str).str.upper()
+    work = work[work['actionability_label'].isin(['WATCH', 'BET', 'MUST TAKE'])].copy()
+    if work.empty:
+        return empty_recs, empty_summary, empty_exposure.copy(), empty_exposure.copy(), empty_exposure.copy()
+
+    work['selected_team'] = [
+        _selected_team(selection, market_type, away, home)
+        for selection, market_type, away, home in zip(
+            work.get('selection', pd.Series(dtype=str)),
+            work.get('market_type', pd.Series(dtype=str)),
+            work.get('away_team', pd.Series(dtype=str)),
+            work.get('home_team', pd.Series(dtype=str)),
+        )
+    ]
+    work['game_key'] = work.apply(_game_key, axis=1)
+    work['team_keys'] = work.apply(_candidate_team_keys, axis=1)
+    work['raw_units'] = pd.to_numeric(work.get('suggested_units_preview'), errors='coerce').fillna(0.0).clip(lower=0.0)
+    multipliers = work.apply(_portfolio_multiplier, axis=1, result_type='expand')
+    work['risk_multiplier'] = multipliers[0]
+    work['uncertainty_penalty'] = multipliers[1]
+    work['actionability_score'] = pd.to_numeric(work.get('actionability_score'), errors='coerce').fillna(0.0)
+    work['edge_value'] = pd.to_numeric(work.get('edge_value'), errors='coerce').fillna(0.0)
+    work['raw_expected_value_per_unit'] = pd.to_numeric(
+        work.get('raw_expected_value_per_unit', work.get('expected_value_per_unit')),
+        errors='coerce',
+    )
+    work['adjusted_expected_value_per_unit'] = pd.to_numeric(
+        work.get('adjusted_expected_value_per_unit', work.get('raw_expected_value_per_unit')),
+        errors='coerce',
+    )
+    work['expected_value_per_unit'] = work['adjusted_expected_value_per_unit']
+    work['uncertainty_score'] = pd.to_numeric(work.get('uncertainty_score'), errors='coerce').fillna(50.0)
+    work['uncertainty_label'] = work.get('uncertainty_label', pd.Series(dtype=str)).astype(str)
+    work['uncertainty_notes'] = work.get('uncertainty_notes', pd.Series(dtype=str)).astype(str)
+
+    same_game_counts = work.groupby('game_key').size().to_dict()
+    team_counts: Dict[str, int] = {}
+    game_market_counts: Dict[Tuple[str, str], int] = {}
+    for _, row in work.iterrows():
+        game_key = str(row.get('game_key') or '')
+        market_type = str(row.get('market_type') or '').lower()
+        game_market_counts[(game_key, market_type)] = game_market_counts.get((game_key, market_type), 0) + 1
+        for team in row.get('team_keys') or []:
+            team_counts[team] = team_counts.get(team, 0) + 1
+
+    work['same_game_peer_count'] = work['game_key'].map(lambda key: max(same_game_counts.get(str(key), 1) - 1, 0))
+    work['same_team_peer_count'] = work['team_keys'].map(lambda keys: _same_team_peer_count(keys, team_counts))
+    work['same_game_cross_market_count'] = work.apply(
+        lambda row: max(
+            same_game_counts.get(str(row.get('game_key') or ''), 1)
+            - game_market_counts.get((str(row.get('game_key') or ''), str(row.get('market_type') or '').lower()), 1),
+            0,
+        ),
+        axis=1,
+    )
+    work['base_correlation_penalty'] = work.apply(lambda row: _base_correlation_penalty(row, config), axis=1)
+    work['demand_units'] = (work['raw_units'] * work['risk_multiplier'] * work['base_correlation_penalty']).round(2)
+    work['priority_score'] = (
+        work['demand_units']
+        * (1.0 + work['actionability_score'].clip(lower=0.0) / 150.0)
+        * (1.0 + work['edge_value'].abs().clip(lower=0.0, upper=0.25) * 2.0)
+        * (1.0 + work['adjusted_expected_value_per_unit'].fillna(0.0).clip(lower=0.0, upper=0.5))
+    )
+    work = work.sort_values(['priority_score', 'actionability_score', 'demand_units'], ascending=[False, False, False]).reset_index(drop=True)
+
+    daily_budget = float(config['daily_budget_units'])
+    max_game_units = float(config['max_game_units'])
+    max_team_units = float(config['max_team_units'])
+    market_caps = {key: float(value) for key, value in config['market_caps'].items()}
+    min_bet_units = float(config['min_bet_units'])
+
+    daily_allocated = 0.0
+    market_exposure: Dict[str, float] = {}
+    game_exposure: Dict[str, float] = {}
+    team_exposure: Dict[str, float] = {}
+    rows = []
+
+    for idx, row in work.iterrows():
+        market_type = str(row.get('market_type') or '').lower()
+        game_key = str(row.get('game_key') or '')
+        team_keys = list(row.get('team_keys') or [])
+        raw_units = _safe_float(row.get('raw_units'))
+        demand_units = _safe_float(row.get('demand_units'))
+        market_cap = market_caps.get(market_type, 0.0)
+        market_used = market_exposure.get(market_type, 0.0)
+        game_used = game_exposure.get(game_key, 0.0)
+        team_used = max([team_exposure.get(team, 0.0) for team in team_keys] or [0.0])
+        market_load = (market_used / market_cap) if market_cap > 0 else 0.0
+        game_load = (game_used / max_game_units) if max_game_units > 0 else 0.0
+        team_load = (team_used / max_team_units) if max_team_units > 0 else 0.0
+        dynamic_penalty = _dynamic_correlation_penalty(game_load, team_load, market_load, config)
+        correlated_demand = round(demand_units * dynamic_penalty, 2)
+
+        market_remaining = max(0.0, market_cap - market_used)
+        game_remaining = max(0.0, max_game_units - game_used)
+        team_remaining = min([max(0.0, max_team_units - team_exposure.get(team, 0.0)) for team in team_keys] or [max_team_units])
+        daily_remaining = max(0.0, daily_budget - daily_allocated)
+        allocatable = min(correlated_demand, market_remaining, game_remaining, team_remaining, daily_remaining)
+        allocated_units = round(allocatable, 2) if allocatable >= min_bet_units else 0.0
+        unallocated_units = round(max(0.0, demand_units - allocated_units), 2)
+        final_penalty = round(_safe_float(row.get('base_correlation_penalty')) * dynamic_penalty, 4)
+
+        cap_notes: List[str] = []
+        if _safe_float(row.get('same_game_peer_count')) > 0:
+            cap_notes.append('same-game correlation trim')
+        if _safe_float(row.get('same_team_peer_count')) > 0:
+            cap_notes.append('same-team correlation trim')
+        if dynamic_penalty < 0.999:
+            cap_notes.append('live concentration trim')
+        if _safe_float(row.get('uncertainty_score')) >= 67.0:
+            cap_notes.append('high uncertainty discount')
+        elif _safe_float(row.get('uncertainty_score')) >= 45.0:
+            cap_notes.append('moderate uncertainty discount')
+        if allocated_units <= 0:
+            cap_notes.append('below minimum unit threshold after cap checks')
+        else:
+            if daily_remaining < correlated_demand:
+                cap_notes.append('daily risk budget cap')
+            if market_remaining < correlated_demand:
+                cap_notes.append(f'{market_type} market cap')
+            if game_remaining < correlated_demand:
+                cap_notes.append('per-game exposure cap')
+            if team_remaining < correlated_demand:
+                cap_notes.append('per-team exposure cap')
+
+        game_after = game_used + allocated_units
+        team_after = max([team_exposure.get(team, 0.0) + allocated_units for team in team_keys] or [allocated_units])
+        if allocated_units > 0:
+            daily_allocated += allocated_units
+            market_exposure[market_type] = market_used + allocated_units
+            game_exposure[game_key] = game_after
+            for team in team_keys:
+                team_exposure[team] = team_exposure.get(team, 0.0) + allocated_units
+
+        rows.append({
+            'run_id': run_id,
+            'report_date': report_date.isoformat(),
+            'phase': phase,
+            'allocation_rank': idx + 1,
+            'market_type': market_type,
+            'selection': str(row.get('selection') or ''),
+            'away_team': str(row.get('away_team') or ''),
+            'home_team': str(row.get('home_team') or ''),
+            'game_pk': _safe_int(row.get('game_pk')),
+            'selected_team': str(row.get('selected_team') or ''),
+            'raw_units': round(raw_units, 2),
+            'demand_units': round(demand_units, 2),
+            'allocated_units': allocated_units,
+            'unallocated_units': unallocated_units,
+            'expected_value_per_unit': _safe_float(row.get('expected_value_per_unit')),
+            'raw_expected_value_per_unit': _safe_float(row.get('raw_expected_value_per_unit')),
+            'adjusted_expected_value_per_unit': _safe_float(row.get('adjusted_expected_value_per_unit')),
+            'edge_value': _safe_float(row.get('edge_value')),
+            'actionability_label': str(row.get('actionability_label') or ''),
+            'actionability_score': _safe_float(row.get('actionability_score')),
+            'confidence_tier': str(row.get('confidence_tier') or ''),
+            'priority_score': round(_safe_float(row.get('priority_score')), 4),
+            'uncertainty_score': _safe_float(row.get('uncertainty_score')),
+            'uncertainty_label': str(row.get('uncertainty_label') or ''),
+            'uncertainty_notes': str(row.get('uncertainty_notes') or ''),
+            'uncertainty_penalty': round(_safe_float(row.get('uncertainty_penalty')), 4),
+            'risk_multiplier': round(_safe_float(row.get('risk_multiplier')), 4),
+            'same_game_peer_count': _safe_int(row.get('same_game_peer_count')),
+            'same_team_peer_count': _safe_int(row.get('same_team_peer_count')),
+            'same_game_cross_market_count': _safe_int(row.get('same_game_cross_market_count')),
+            'base_correlation_penalty': round(_safe_float(row.get('base_correlation_penalty')), 4),
+            'dynamic_correlation_penalty': round(dynamic_penalty, 4),
+            'final_correlation_penalty': final_penalty,
+            'game_exposure_after': round(game_after, 2),
+            'team_exposure_after': round(team_after, 2),
+            'portfolio_share_pct': round((allocated_units / daily_budget) if daily_budget > 0 else 0.0, 4),
+            'cap_notes': '; '.join(dict.fromkeys(cap_notes)),
+            'market_label': str(row.get('market_label') or ''),
+            'sportsbook_count': _safe_int(row.get('sportsbook_count')),
+        })
+
+    recommendations = pd.DataFrame(rows, columns=PORTFOLIO_RECOMMENDATION_COLUMNS)
+    allocated_candidate_count = int((recommendations['allocated_units'] > 0).sum()) if not recommendations.empty else 0
+    largest_game_units = max(game_exposure.values()) if game_exposure else 0.0
+    largest_team_units = max(team_exposure.values()) if team_exposure else 0.0
+    avg_correlation_penalty = float(recommendations['final_correlation_penalty'].mean()) if not recommendations.empty else 0.0
+    correlated_candidate_count = int(((recommendations['same_game_peer_count'] > 0) | (recommendations['same_team_peer_count'] > 0)).sum()) if not recommendations.empty else 0
+    avg_uncertainty_score = float(recommendations['uncertainty_score'].mean()) if not recommendations.empty else 0.0
+    high_uncertainty_candidate_count = int((recommendations['uncertainty_label'].astype(str).str.upper() == 'HIGH').sum()) if not recommendations.empty else 0
+    summary = pd.DataFrame([{
+        'run_id': run_id,
+        'report_date': report_date.isoformat(),
+        'phase': phase,
+        'daily_budget_units': daily_budget,
+        'raw_demand_units': round(float(work['raw_units'].sum()), 2),
+        'demand_units': round(float(work['demand_units'].sum()), 2),
+        'allocated_units': round(float(recommendations['allocated_units'].sum()) if not recommendations.empty else 0.0, 2),
+        'unallocated_units': round(float(recommendations['unallocated_units'].sum()) if not recommendations.empty else 0.0, 2),
+        'utilization_pct': round((float(recommendations['allocated_units'].sum()) if not recommendations.empty else 0.0) / daily_budget, 4) if daily_budget > 0 else 0.0,
+        'candidate_count': int(len(recommendations)),
+        'allocated_candidate_count': allocated_candidate_count,
+        'watch_count': int((recommendations['actionability_label'] == 'WATCH').sum()) if not recommendations.empty else 0,
+        'bet_count': int((recommendations['actionability_label'] == 'BET').sum()) if not recommendations.empty else 0,
+        'must_take_count': int((recommendations['actionability_label'] == 'MUST TAKE').sum()) if not recommendations.empty else 0,
+        'max_game_units': max_game_units,
+        'max_team_units': max_team_units,
+        'max_moneyline_units': market_caps.get('moneyline', 0.0),
+        'max_run_line_units': market_caps.get('run_line', 0.0),
+        'max_total_units': market_caps.get('total', 0.0),
+        'base_unit_risk_pct': config['unit_risk_pct'],
+        'max_daily_risk_pct': round(daily_budget * config['unit_risk_pct'], 4),
+        'largest_game_exposure_units': round(largest_game_units, 2),
+        'largest_team_exposure_units': round(largest_team_units, 2),
+        'largest_game_exposure_pct': round((largest_game_units / daily_budget) if daily_budget > 0 else 0.0, 4),
+        'largest_team_exposure_pct': round((largest_team_units / daily_budget) if daily_budget > 0 else 0.0, 4),
+        'avg_correlation_penalty': round(avg_correlation_penalty, 4),
+        'correlated_candidate_count': correlated_candidate_count,
+        'avg_uncertainty_score': round(avg_uncertainty_score, 1),
+        'high_uncertainty_candidate_count': high_uncertainty_candidate_count,
+    }], columns=PORTFOLIO_SUMMARY_COLUMNS)
+
+    raw_market = work.groupby('market_type', dropna=False).agg(raw_units=('raw_units', 'sum'), candidate_count=('selection', 'size')).reset_index().rename(columns={'market_type': 'bucket'})
+    alloc_market = recommendations.groupby('market_type', dropna=False).agg(allocated_units=('allocated_units', 'sum')).reset_index().rename(columns={'market_type': 'bucket'}) if not recommendations.empty else pd.DataFrame(columns=['bucket', 'allocated_units'])
+    market_exposure_frame = _build_exposure_frame(run_id, report_date, phase, 'market', raw_market, alloc_market)
+
+    raw_game = work.groupby('game_key', dropna=False).agg(raw_units=('raw_units', 'sum'), candidate_count=('selection', 'size')).reset_index().rename(columns={'game_key': 'bucket'})
+    alloc_game = recommendations.groupby(recommendations.get('away_team').astype(str) + '@' + recommendations.get('home_team').astype(str), dropna=False).agg(allocated_units=('allocated_units', 'sum')).reset_index().rename(columns={'index': 'bucket', 0: 'bucket'}) if not recommendations.empty else pd.DataFrame(columns=['bucket', 'allocated_units'])
+    if not alloc_game.empty and 'bucket' not in alloc_game.columns:
+        alloc_game.columns = ['bucket', 'allocated_units']
+    market_game_key_map = recommendations.apply(_game_key, axis=1) if not recommendations.empty else pd.Series(dtype=str)
+    if not recommendations.empty:
+        alloc_game = pd.DataFrame({'bucket': market_game_key_map, 'allocated_units': recommendations['allocated_units']}).groupby('bucket', dropna=False).agg(allocated_units=('allocated_units', 'sum')).reset_index()
+    game_exposure_frame = _build_exposure_frame(run_id, report_date, phase, 'game', raw_game, alloc_game)
+
+    team_rows = []
+    for _, row in work.iterrows():
+        for team in row.get('team_keys') or []:
+            team_rows.append({'bucket': team, 'raw_units': _safe_float(row.get('raw_units')), 'candidate_count': 1})
+    raw_team = pd.DataFrame(team_rows)
+    if raw_team.empty:
+        raw_team = pd.DataFrame(columns=['bucket', 'raw_units', 'candidate_count'])
+    else:
+        raw_team = raw_team.groupby('bucket', dropna=False).agg(raw_units=('raw_units', 'sum'), candidate_count=('candidate_count', 'sum')).reset_index()
+
+    alloc_team_rows = []
+    for _, row in recommendations.iterrows():
+        keys = _candidate_team_keys(pd.Series({'market_type': row.get('market_type'), 'selected_team': row.get('selected_team'), 'away_team': row.get('away_team'), 'home_team': row.get('home_team')}))
+        for team in keys:
+            alloc_team_rows.append({'bucket': team, 'allocated_units': _safe_float(row.get('allocated_units'))})
+    alloc_team = pd.DataFrame(alloc_team_rows)
+    if alloc_team.empty:
+        alloc_team = pd.DataFrame(columns=['bucket', 'allocated_units'])
+    else:
+        alloc_team = alloc_team.groupby('bucket', dropna=False).agg(allocated_units=('allocated_units', 'sum')).reset_index()
+    team_exposure_frame = _build_exposure_frame(run_id, report_date, phase, 'team', raw_team, alloc_team)
+
+    return recommendations, summary, market_exposure_frame, team_exposure_frame, game_exposure_frame

@@ -1,0 +1,1599 @@
+from __future__ import annotations
+
+import datetime as dt
+import json
+from typing import Any, Dict
+
+import numpy as np
+import pandas as pd
+
+try:  # pragma: no cover - optional runtime dependency
+    import streamlit as st
+except ModuleNotFoundError as exc:  # pragma: no cover
+    raise SystemExit(
+        'Streamlit is required to run this dashboard. Install the packages in quant_dashboard_requirements.txt and run `streamlit run quant_dashboard.py`.'
+    ) from exc
+
+try:  # pragma: no cover - optional runtime dependency
+    import plotly.express as px
+except ModuleNotFoundError:  # pragma: no cover
+    px = None
+
+import policy_research
+import portfolio_engine as portfolio
+import quant_store
+
+
+def _frame_or_empty(value: Any) -> pd.DataFrame:
+    return value if isinstance(value, pd.DataFrame) else pd.DataFrame()
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        if value is None or pd.isna(value):
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _fmt_pct(value: Any) -> str:
+    numeric = _safe_float(value)
+    return 'N/A' if numeric is None else f'{numeric * 100:.1f}%'
+
+
+def _fmt_num(value: Any, digits: int = 3) -> str:
+    numeric = _safe_float(value)
+    return 'N/A' if numeric is None else f'{numeric:.{digits}f}'
+
+
+def _daily_validation(backtest: pd.DataFrame) -> pd.DataFrame:
+    if backtest.empty or 'date' not in backtest.columns:
+        return pd.DataFrame()
+    work = backtest.copy()
+    work['date'] = pd.to_datetime(work['date'], errors='coerce').dt.date
+    work['p_home'] = pd.to_numeric(work.get('p_home'), errors='coerce').clip(1e-6, 1.0 - 1e-6)
+    work['y_home'] = pd.to_numeric(work.get('y_home'), errors='coerce')
+    work['projected_total'] = pd.to_numeric(work.get('projected_total'), errors='coerce')
+    work['projected_margin'] = pd.to_numeric(work.get('projected_margin'), errors='coerce')
+    work['home_score'] = pd.to_numeric(work.get('home_score'), errors='coerce')
+    work['away_score'] = pd.to_numeric(work.get('away_score'), errors='coerce')
+    work = work.dropna(subset=['date'])
+    if work.empty:
+        return pd.DataFrame()
+    rows = []
+    for target_date, grp in work.groupby('date'):
+        prob_grp = grp.dropna(subset=['p_home', 'y_home']).copy()
+        total_grp = grp.dropna(subset=['projected_total', 'home_score', 'away_score']).copy()
+        margin_grp = grp.dropna(subset=['projected_margin', 'home_score', 'away_score']).copy()
+        log_loss = None
+        accuracy = None
+        if not prob_grp.empty:
+            p = prob_grp['p_home'].astype(float)
+            y = prob_grp['y_home'].astype(int)
+            log_loss = float((-(y * np.log(p)) - ((1 - y) * np.log(1.0 - p))).mean())
+            accuracy = float(((p >= 0.5).astype(int) == y).mean())
+        total_mae = None
+        margin_mae = None
+        if not total_grp.empty:
+            actual_total = total_grp['home_score'] + total_grp['away_score']
+            total_mae = float((actual_total - total_grp['projected_total']).abs().mean())
+        if not margin_grp.empty:
+            actual_margin = margin_grp['home_score'] - margin_grp['away_score']
+            margin_mae = float((actual_margin - margin_grp['projected_margin']).abs().mean())
+        rows.append({
+            'date': target_date,
+            'games': int(len(grp)),
+            'log_loss': log_loss,
+            'accuracy': accuracy,
+            'total_mae': total_mae,
+            'margin_mae': margin_mae,
+        })
+    return pd.DataFrame(rows).sort_values('date').reset_index(drop=True)
+
+
+def _calibration_table(backtest: pd.DataFrame) -> pd.DataFrame:
+    if backtest.empty or 'p_home' not in backtest.columns or 'y_home' not in backtest.columns:
+        return pd.DataFrame()
+    work = backtest.copy()
+    work['p_home'] = pd.to_numeric(work.get('p_home'), errors='coerce')
+    work['y_home'] = pd.to_numeric(work.get('y_home'), errors='coerce')
+    work = work.dropna(subset=['p_home', 'y_home'])
+    if work.empty:
+        return pd.DataFrame()
+    bins = pd.interval_range(start=0.35, end=0.85, periods=5)
+    work['bucket'] = pd.cut(work['p_home'], bins=bins)
+    rows = []
+    for bucket, grp in work.groupby('bucket', dropna=True):
+        rows.append({
+            'bucket': str(bucket),
+            'games': int(len(grp)),
+            'predicted_win_rate': float(grp['p_home'].mean()),
+            'actual_win_rate': float(grp['y_home'].mean()),
+        })
+    return pd.DataFrame(rows)
+
+
+def _render_line_chart(frame: pd.DataFrame, x_col: str, y_col: str, title: str):
+    if frame.empty or y_col not in frame.columns:
+        st.info(f'No data available for {title.lower()}.')
+        return
+    if px is not None:
+        st.plotly_chart(px.line(frame, x=x_col, y=y_col, title=title), use_container_width=True)
+    else:
+        st.line_chart(frame.set_index(x_col)[y_col], use_container_width=True)
+
+
+def _render_bar_chart(frame: pd.DataFrame, x_col: str, y_col: str, title: str, color_col: str | None = None):
+    if frame.empty or y_col not in frame.columns:
+        st.info(f'No data available for {title.lower()}.')
+        return
+    if px is not None:
+        kwargs: Dict[str, Any] = {'title': title}
+        if color_col and color_col in frame.columns:
+            kwargs['color'] = color_col
+        st.plotly_chart(px.bar(frame, x=x_col, y=y_col, **kwargs), use_container_width=True)
+    else:
+        st.bar_chart(frame.set_index(x_col)[y_col], use_container_width=True)
+
+
+def _yes_no(value: Any) -> str:
+    return 'Yes' if bool(value) else 'No'
+
+
+def _market_policy_overview_frame(latest: Dict[str, Any]) -> pd.DataFrame:
+    rows = []
+    for market_key, market_label in [('moneyline', 'Moneyline'), ('total', 'Total'), ('run_line', 'Run line')]:
+        policy_name = str(latest.get(f'market_policy_{market_key}_policy') or '').strip()
+        posture_name = str(latest.get(f'market_policy_{market_key}_posture') or '').strip()
+        evidence_source = str(latest.get(f'market_policy_{market_key}_evidence_source') or '').strip()
+        evidence_strength = str(latest.get(f'market_policy_{market_key}_evidence_strength') or '').strip()
+        if not any([policy_name, posture_name, evidence_source, evidence_strength]):
+            continue
+        rows.append({
+            'Market': market_label,
+            'Policy': policy_name or 'N/A',
+            'Posture': posture_name or 'N/A',
+            'Evidence source': evidence_source or 'N/A',
+            'Evidence strength': evidence_strength or 'N/A',
+            'Real-market active': _yes_no(latest.get(f'market_policy_{market_key}_used_real_market')),
+            'Policy changed': _yes_no(latest.get(f'market_policy_{market_key}_policy_changed')),
+            'Strength changed': _yes_no(latest.get(f'market_policy_{market_key}_strength_changed')),
+        })
+    return pd.DataFrame(rows)
+
+def _portfolio_plain_english(utilization_pct: Any, correlated_candidates: Any, game_concentration_pct: Any, team_concentration_pct: Any) -> str:
+    utilization = _safe_float(utilization_pct) or 0.0
+    correlated = int(correlated_candidates or 0)
+    game_pct = _safe_float(game_concentration_pct) or 0.0
+    team_pct = _safe_float(team_concentration_pct) or 0.0
+    notes = []
+    if utilization < 0.25:
+        notes.append('The model is deploying lightly, which usually means it does not see many prices worth pressing.')
+    elif utilization < 0.60:
+        notes.append('The model is taking a measured amount of risk instead of pushing the whole slate.')
+    else:
+        notes.append('The model is leaning into this slate, so exposure control matters more than usual.')
+    if correlated <= 0:
+        notes.append('There is little overlap between positions, so one game is less likely to dominate the whole card.')
+    else:
+        notes.append(f'{correlated} positions share game or team exposure, so the allocator is trimming overlap before it sizes them.')
+    if max(game_pct, team_pct) >= 0.35:
+        notes.append('One game or team is carrying a heavy share of the slate, so concentration risk is elevated.')
+    elif max(game_pct, team_pct) >= 0.20:
+        notes.append('There is some concentration in the book, but it is still in a manageable range.')
+    else:
+        notes.append('Exposure is fairly spread out, which keeps single-game damage more contained.')
+    return ' '.join(notes)
+
+
+def _clip(value: Any, low: float, high: float) -> float:
+    numeric = _safe_float(value)
+    if numeric is None:
+        numeric = low
+    return max(low, min(high, float(numeric)))
+
+
+def _policy_specs() -> Dict[str, Dict[str, Any]]:
+    return {
+        'Flat': {
+            'technical': 'Uses the allocator output directly with no extra edge-based rescaling.',
+            'plain_english': 'Every approved play stays close to the base size, which keeps the plan simple and predictable.',
+        },
+        'Fractional Kelly Proxy': {
+            'technical': 'Scales positions by expected value, confidence, and correlation penalty using a Kelly-like proxy rather than a full closed-form Kelly formula.',
+            'plain_english': 'Stronger model edges get sized a bit bigger and thinner edges get sized a bit smaller.',
+        },
+        'Risk-Capped Hybrid': {
+            'technical': 'Starts from a Kelly-style edge response, then applies extra concentration drag to correlated same-game and same-team exposure.',
+            'plain_english': 'This tries to press the best ideas while still protecting the slate from becoming too dependent on one game or one team.',
+        },
+    }
+
+
+def _risk_posture_specs() -> Dict[str, Dict[str, Any]]:
+    return {
+        'Conservative': {
+            'unit_mult': 0.75,
+            'deployment_mult': 0.75,
+            'plain_english': 'This keeps daily swings lower and prioritizes capital preservation.',
+        },
+        'Base': {
+            'unit_mult': 1.00,
+            'deployment_mult': 1.00,
+            'plain_english': 'This is the default balance between upside and drawdown control.',
+        },
+        'Aggressive': {
+            'unit_mult': 1.20,
+            'deployment_mult': 1.20,
+            'plain_english': 'This leans in harder, so both upside and downside get magnified.',
+        },
+    }
+
+
+def _portfolio_team_keys(row: pd.Series) -> list[str]:
+    market_type = str(row.get('market_type') or '').lower()
+    selected_team = str(row.get('selected_team') or '').strip().upper()
+    away_team = str(row.get('away_team') or '').strip().upper()
+    home_team = str(row.get('home_team') or '').strip().upper()
+    if market_type == 'total':
+        return [team for team in [away_team, home_team] if team]
+    if selected_team:
+        return [selected_team]
+    return [team for team in [away_team, home_team] if team][:1]
+
+
+def _portfolio_game_bucket(row: pd.Series) -> str:
+    game_pk = row.get('game_pk')
+    if pd.notna(game_pk):
+        try:
+            return f"gamepk:{int(float(game_pk))}"
+        except Exception:
+            pass
+    return f"{str(row.get('away_team') or '').upper()}@{str(row.get('home_team') or '').upper()}"
+
+
+def _apply_policy_to_recommendations(summary_row: Dict[str, Any], recommendations: pd.DataFrame, policy_name: str, posture_name: str, bankroll: float, unit_risk_pct: float, deployment_scalar: float):
+    policy = _policy_specs().get(policy_name, _policy_specs()['Flat'])
+    posture = _risk_posture_specs().get(posture_name, _risk_posture_specs()['Base'])
+    recommendation_frame = recommendations.copy() if isinstance(recommendations, pd.DataFrame) else pd.DataFrame()
+    if recommendation_frame.empty:
+        return recommendation_frame, {
+            'policy_name': policy_name,
+            'posture_name': posture_name,
+            'unit_size_dollars': bankroll * (unit_risk_pct / 100.0) * posture['unit_mult'],
+            'deployed_risk_dollars': 0.0,
+            'expected_value_dollars': 0.0,
+            'max_loss_dollars': 0.0,
+            'game_risk_dollars': 0.0,
+            'team_risk_dollars': 0.0,
+            'daily_budget_units': ((_safe_float(summary_row.get('daily_budget_units')) if summary_row else 0.0) or 0.0) * posture['deployment_mult'] * deployment_scalar,
+            'budget_scale': 1.0,
+            'policy_description': policy['technical'],
+            'plain_english': f"{policy['plain_english']} {posture['plain_english']}",
+            'avg_correlation_penalty': _safe_float(summary_row.get('avg_correlation_penalty')) if summary_row else None,
+        }, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    rec = recommendation_frame.copy()
+    for col in ['allocated_units', 'expected_value_per_unit', 'edge_value', 'actionability_score', 'final_correlation_penalty', 'same_game_peer_count', 'same_team_peer_count']:
+        rec[col] = pd.to_numeric(rec.get(col), errors='coerce').fillna(0.0)
+    rec['game_bucket'] = rec.apply(_portfolio_game_bucket, axis=1)
+    rec['team_keys'] = rec.apply(_portfolio_team_keys, axis=1)
+
+    def _policy_factor(row: pd.Series):
+        ev = _clip(row.get('expected_value_per_unit'), 0.0, 0.20)
+        edge = _clip(abs(_safe_float(row.get('edge_value')) or 0.0), 0.0, 0.15)
+        action = _clip((_safe_float(row.get('actionability_score')) or 0.0) / 100.0, 0.40, 1.00)
+        corr = _clip(row.get('final_correlation_penalty'), 0.45, 1.00)
+        same_game = int(_safe_float(row.get('same_game_peer_count')) or 0)
+        same_team = int(_safe_float(row.get('same_team_peer_count')) or 0)
+        if policy_name == 'Flat':
+            return 1.0, 'Keeps the allocator size as-is.'
+        if policy_name == 'Fractional Kelly Proxy':
+            factor = _clip((0.55 + (2.50 * ev) + (0.75 * edge) + (0.15 * action)) * (0.85 + (0.15 * corr)), 0.45, 1.35)
+            return factor, 'Scales up cleaner, higher-EV edges and scales down weaker ones.'
+        concentration_drag = _clip(1.0 - (0.06 * same_game) - (0.05 * same_team), 0.70, 1.00)
+        factor = _clip(min(0.60 + (2.20 * ev) + (0.60 * edge) + (0.10 * action), 1.10) * concentration_drag * (0.90 + (0.10 * corr)), 0.50, 1.10)
+        return factor, 'Uses a Kelly-like response but trims crowded game and team exposure harder.'
+
+    policy_details = rec.apply(_policy_factor, axis=1, result_type='expand')
+    rec['policy_factor'] = pd.to_numeric(policy_details[0], errors='coerce').fillna(1.0)
+    rec['policy_note'] = policy_details[1].astype(str)
+
+    base_units = rec['allocated_units'] * posture['deployment_mult'] * deployment_scalar
+    rec['policy_units_raw'] = base_units * rec['policy_factor']
+    budget_units = (((_safe_float(summary_row.get('daily_budget_units')) if summary_row else None) or float(rec['allocated_units'].sum()) or 0.0) * posture['deployment_mult'] * deployment_scalar)
+    raw_total = float(rec['policy_units_raw'].sum())
+    budget_scale = min(1.0, (budget_units / raw_total)) if raw_total > 1e-9 else 1.0
+    rec['policy_units'] = rec['policy_units_raw'] * budget_scale
+
+    unit_size_dollars = bankroll * ((unit_risk_pct / 100.0) * posture['unit_mult'])
+    rec['policy_risk_dollars'] = rec['policy_units'] * unit_size_dollars
+    rec['policy_expected_value_dollars'] = rec['policy_units'] * rec['expected_value_per_unit'] * unit_size_dollars
+
+    market_exposure = rec.groupby('market_type', dropna=False).agg(
+        policy_units=('policy_units', 'sum'),
+        policy_risk_dollars=('policy_risk_dollars', 'sum'),
+        candidate_count=('selection', 'size'),
+    ).reset_index().rename(columns={'market_type': 'bucket'})
+
+    game_exposure = rec.groupby('game_bucket', dropna=False).agg(
+        policy_units=('policy_units', 'sum'),
+        policy_risk_dollars=('policy_risk_dollars', 'sum'),
+        candidate_count=('selection', 'size'),
+    ).reset_index().rename(columns={'game_bucket': 'bucket'})
+
+    team_rows = []
+    for _, row in rec.iterrows():
+        for team in row.get('team_keys') or []:
+            team_rows.append({'bucket': team, 'policy_units': row['policy_units'], 'policy_risk_dollars': row['policy_risk_dollars']})
+    team_exposure = pd.DataFrame(team_rows)
+    if not team_exposure.empty:
+        team_exposure = team_exposure.groupby('bucket', dropna=False).agg(
+            policy_units=('policy_units', 'sum'),
+            policy_risk_dollars=('policy_risk_dollars', 'sum'),
+            candidate_count=('bucket', 'size'),
+        ).reset_index()
+    else:
+        team_exposure = pd.DataFrame(columns=['bucket', 'policy_units', 'policy_risk_dollars', 'candidate_count'])
+
+    summary = {
+        'policy_name': policy_name,
+        'posture_name': posture_name,
+        'unit_size_dollars': unit_size_dollars,
+        'deployed_risk_dollars': float(rec['policy_risk_dollars'].sum()),
+        'expected_value_dollars': float(rec['policy_expected_value_dollars'].sum()),
+        'max_loss_dollars': float(rec['policy_risk_dollars'].sum()),
+        'game_risk_dollars': float(game_exposure['policy_risk_dollars'].max()) if not game_exposure.empty else 0.0,
+        'team_risk_dollars': float(team_exposure['policy_risk_dollars'].max()) if not team_exposure.empty else 0.0,
+        'daily_budget_units': budget_units,
+        'budget_scale': budget_scale,
+        'policy_description': policy['technical'],
+        'plain_english': f"{policy['plain_english']} {posture['plain_english']}",
+        'avg_correlation_penalty': float(rec['final_correlation_penalty'].mean()) if 'final_correlation_penalty' in rec.columns else None,
+    }
+    return rec, summary, market_exposure, team_exposure, game_exposure
+
+
+def _build_portfolio_scenarios(summary_row: Dict[str, Any], recommendations: pd.DataFrame, bankroll: float, unit_risk_pct: float, deployment_scalar: float, posture_name: str) -> pd.DataFrame:
+    rows = []
+    for policy_name, policy in _policy_specs().items():
+        _, policy_summary, _, _, _ = _apply_policy_to_recommendations(
+            summary_row,
+            recommendations,
+            policy_name,
+            posture_name,
+            bankroll,
+            unit_risk_pct,
+            deployment_scalar,
+        )
+        rows.append({
+            'scenario': policy_name,
+            'unit_risk_pct': round((unit_risk_pct * _risk_posture_specs().get(posture_name, _risk_posture_specs()['Base'])['unit_mult']), 2),
+            'deployment_scalar': round(deployment_scalar * _risk_posture_specs().get(posture_name, _risk_posture_specs()['Base'])['deployment_mult'], 2),
+            'unit_size_dollars': round(_safe_float(policy_summary.get('unit_size_dollars')) or 0.0, 2),
+            'deployed_risk_dollars': round(_safe_float(policy_summary.get('deployed_risk_dollars')) or 0.0, 2),
+            'expected_value_dollars': round(_safe_float(policy_summary.get('expected_value_dollars')) or 0.0, 2),
+            'max_loss_dollars': round(_safe_float(policy_summary.get('max_loss_dollars')) or 0.0, 2),
+            'game_risk_dollars': round(_safe_float(policy_summary.get('game_risk_dollars')) or 0.0, 2),
+            'team_risk_dollars': round(_safe_float(policy_summary.get('team_risk_dollars')) or 0.0, 2),
+            'avg_correlation_penalty': round(_safe_float(policy_summary.get('avg_correlation_penalty')) or 0.0, 3),
+            'technical_note': policy['technical'],
+            'plain_english': policy_summary.get('plain_english') or policy['plain_english'],
+        })
+    return pd.DataFrame(rows)
+
+
+
+def _confidence_tier_from_probability(probability: Any) -> str:
+    numeric = _safe_float(probability)
+    if numeric is None:
+        return 'LOW'
+    confidence = max(min(max(numeric, 1.0 - numeric), 1.0), 0.5)
+    if confidence >= 0.67:
+        return 'HIGH'
+    if confidence >= 0.60:
+        return 'MEDIUM'
+    return 'LOW'
+
+
+def _shadow_actionability_label(confidence: float) -> str:
+    if confidence >= 0.67:
+        return 'MUST TAKE'
+    if confidence >= 0.60:
+        return 'BET'
+    if confidence >= 0.55:
+        return 'WATCH'
+    return 'PASS'
+
+
+def _shadow_candidate_frame_from_archive(live_archive: pd.DataFrame) -> pd.DataFrame:
+    required_columns = {'report_date', 'away', 'home', 'p_home', 'p_home_simple', 'y_home'}
+    if live_archive.empty or not required_columns.issubset(live_archive.columns):
+        return pd.DataFrame()
+    work = live_archive.copy()
+    work['report_date'] = pd.to_datetime(work.get('report_date'), errors='coerce').dt.date
+    work['p_home'] = pd.to_numeric(work.get('p_home'), errors='coerce')
+    work['p_home_simple'] = pd.to_numeric(work.get('p_home_simple'), errors='coerce').fillna(0.5)
+    work['y_home'] = pd.to_numeric(work.get('y_home'), errors='coerce')
+    work = work.dropna(subset=['report_date', 'p_home', 'y_home', 'away', 'home']).copy()
+    if work.empty:
+        return pd.DataFrame()
+    work['phase'] = work.get('phase', 'spring').fillna('spring').astype(str).str.lower()
+    work['model_confidence'] = work['p_home'].map(lambda value: max(min(max(float(value), 1.0 - float(value)), 1.0), 0.5))
+    work['predicted_home'] = work['p_home'] >= 0.5
+    work['selection'] = np.where(work['predicted_home'], work['home'].astype(str), work['away'].astype(str))
+    work['selected_team'] = work['selection'].astype(str).str.upper()
+    work['confidence_tier'] = work['p_home'].map(_confidence_tier_from_probability)
+    work['actionability_label'] = work['model_confidence'].map(_shadow_actionability_label)
+    confidence_gap = (work['model_confidence'] - 0.5).clip(lower=0.0)
+    simple_gap = (work['p_home_simple'] - 0.5).abs().clip(lower=0.0)
+    work['actionability_score'] = (35.0 + (confidence_gap / 0.17).clip(upper=1.0) * 55.0).round(1)
+    work['edge_value'] = (work['p_home'] - work['p_home_simple']).abs().clip(lower=0.0, upper=0.15)
+    work['expected_value_per_unit'] = (confidence_gap * 0.80).clip(lower=0.0, upper=0.20)
+    work['suggested_units_preview'] = pd.Series(
+        np.select(
+            [
+                work['actionability_label'] == 'WATCH',
+                work['actionability_label'] == 'BET',
+                work['actionability_label'] == 'MUST TAKE',
+            ],
+            [
+                0.20 + (confidence_gap * 1.20),
+                0.40 + (confidence_gap * 1.50),
+                0.65 + (confidence_gap * 1.75),
+            ],
+            default=0.0,
+        ),
+        index=work.index,
+    ).clip(lower=0.0, upper=1.20).round(2)
+    work['candidate_score'] = (
+        work['expected_value_per_unit'].fillna(0.0)
+        * (1.0 + work['actionability_score'].fillna(0.0) / 100.0)
+        * (1.0 + (work['edge_value'].fillna(0.0) + simple_gap).clip(upper=0.25))
+    )
+    work['shadow_result_per_unit'] = np.where(
+        (work['predicted_home'] & (work['y_home'] >= 0.5)) | ((~work['predicted_home']) & (work['y_home'] < 0.5)),
+        1.0,
+        -1.0,
+    )
+    work['market_type'] = 'moneyline'
+    work['market_label'] = 'Shadow archive'
+    work['sportsbook_count'] = 0
+    work['book_price'] = np.nan
+    work['fair_price'] = np.nan
+    work['line_value'] = np.nan
+    work['game_pk'] = pd.to_numeric(work.get('game_pk'), errors='coerce')
+    work['away_team'] = work['away'].astype(str).str.upper()
+    work['home_team'] = work['home'].astype(str).str.upper()
+    work['actionability_notes'] = np.where(
+        work['actionability_label'] == 'PASS',
+        'Shadow archive confidence was too weak to simulate an allocated position.',
+        'Shadow archive position based on the model main-side pick at even-money normalized grading.',
+    )
+    columns = [
+        'report_date', 'phase', 'game_pk', 'away_team', 'home_team', 'market_label', 'sportsbook_count',
+        'confidence_tier', 'market_type', 'selection', 'line_value', 'book_price', 'fair_price',
+        'edge_value', 'actionability_label', 'actionability_score', 'actionability_notes',
+        'expected_value_per_unit', 'suggested_units_preview', 'candidate_score', 'selected_team',
+        'shadow_result_per_unit',
+    ]
+    return work[columns].reset_index(drop=True)
+
+
+def _build_shadow_policy_backtest(live_archive: pd.DataFrame, bankroll: float, unit_risk_pct: float, deployment_scalar: float, posture_name: str):
+    shadow_candidates = _shadow_candidate_frame_from_archive(live_archive)
+    if shadow_candidates.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    daily_rows = []
+    for report_date, day_candidates in shadow_candidates.groupby('report_date', dropna=True):
+        phase = str(day_candidates['phase'].iloc[0] or 'spring').lower()
+        recs, summary_frame, _, _, _ = portfolio.build_portfolio_plan(
+            day_candidates,
+            phase,
+            f"shadow_{report_date.isoformat()}",
+            report_date,
+        )
+        summary_row = {} if summary_frame.empty else summary_frame.iloc[0].to_dict()
+        if recs.empty:
+            continue
+        shadow_lookup = day_candidates[['away_team', 'home_team', 'market_type', 'selection', 'shadow_result_per_unit']].drop_duplicates()
+        recs = recs.merge(
+            shadow_lookup,
+            on=['away_team', 'home_team', 'market_type', 'selection'],
+            how='left',
+        )
+        for policy_name in _policy_specs().keys():
+            policy_view, policy_summary, _, _, _ = _apply_policy_to_recommendations(
+                summary_row,
+                recs,
+                policy_name,
+                posture_name,
+                bankroll,
+                unit_risk_pct,
+                deployment_scalar,
+            )
+            if policy_view.empty:
+                continue
+            result_units = float((policy_view['policy_units'] * policy_view['shadow_result_per_unit']).sum())
+            risk_units = float(policy_view['policy_units'].sum())
+            unit_size_dollars = float(_safe_float(policy_summary.get('unit_size_dollars')) or 0.0)
+            picks = int(len(policy_view))
+            hits = int((pd.to_numeric(policy_view['shadow_result_per_unit'], errors='coerce').fillna(-1.0) > 0).sum())
+            daily_rows.append({
+                'report_date': report_date,
+                'phase': phase,
+                'policy_name': policy_name,
+                'posture_name': posture_name,
+                'games': int(len(day_candidates)),
+                'picks': picks,
+                'hits': hits,
+                'hit_rate': (hits / picks) if picks else None,
+                'risk_units': risk_units,
+                'result_units': result_units,
+                'yield_pct': (result_units / risk_units) if risk_units > 1e-9 else None,
+                'unit_size_dollars': unit_size_dollars,
+                'risk_dollars': risk_units * unit_size_dollars,
+                'result_dollars': result_units * unit_size_dollars,
+                'avg_correlation_penalty': _safe_float(policy_summary.get('avg_correlation_penalty')),
+                'plain_english': policy_summary.get('plain_english') or '',
+            })
+    daily_frame = pd.DataFrame(daily_rows)
+    if daily_frame.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    daily_frame = daily_frame.sort_values(['policy_name', 'report_date']).reset_index(drop=True)
+    daily_frame['cumulative_units'] = daily_frame.groupby('policy_name')['result_units'].cumsum()
+    daily_frame['cumulative_dollars'] = daily_frame.groupby('policy_name')['result_dollars'].cumsum()
+    daily_frame['rolling_peak_units'] = daily_frame.groupby('policy_name')['cumulative_units'].cummax()
+    daily_frame['drawdown_units'] = daily_frame['cumulative_units'] - daily_frame['rolling_peak_units']
+    daily_frame['rolling_peak_dollars'] = daily_frame.groupby('policy_name')['cumulative_dollars'].cummax()
+    daily_frame['drawdown_dollars'] = daily_frame['cumulative_dollars'] - daily_frame['rolling_peak_dollars']
+    summary_rows = []
+    for policy_name, grp in daily_frame.groupby('policy_name', dropna=True):
+        total_risk_units = float(grp['risk_units'].sum())
+        total_result_units = float(grp['result_units'].sum())
+        total_risk_dollars = float(grp['risk_dollars'].sum())
+        total_result_dollars = float(grp['result_dollars'].sum())
+        total_picks = int(grp['picks'].sum())
+        total_hits = int(grp['hits'].sum())
+        max_drawdown_units = abs(float(grp['drawdown_units'].min() or 0.0))
+        max_drawdown_dollars = abs(float(grp['drawdown_dollars'].min() or 0.0))
+        worst_day_units = float(grp['result_units'].min() or 0.0)
+        avg_daily_risk = float(grp['risk_dollars'].mean() or 0.0)
+        if max_drawdown_units <= 1.0 and total_result_units >= 0.0:
+            takeaway = 'This was the smoothest path, with smaller swings and more contained drawdowns.'
+        elif total_result_units > 0.0 and max_drawdown_units > 1.0:
+            takeaway = 'This produced more upside, but it asked you to tolerate visibly larger swings.'
+        else:
+            takeaway = 'This sizing style has not earned trust yet on the archived shadow sample.'
+        summary_rows.append({
+            'policy_name': policy_name,
+            'posture_name': posture_name,
+            'settled_slates': int(len(grp)),
+            'settled_games': int(grp['games'].sum()),
+            'settled_picks': total_picks,
+            'hit_rate': (total_hits / total_picks) if total_picks else None,
+            'risk_units': total_risk_units,
+            'result_units': total_result_units,
+            'yield_pct': (total_result_units / total_risk_units) if total_risk_units > 1e-9 else None,
+            'risk_dollars': total_risk_dollars,
+            'result_dollars': total_result_dollars,
+            'max_drawdown_units': max_drawdown_units,
+            'max_drawdown_dollars': max_drawdown_dollars,
+            'worst_day_units': worst_day_units,
+            'avg_daily_risk_dollars': avg_daily_risk,
+            'avg_correlation_penalty': float(grp['avg_correlation_penalty'].dropna().mean()) if 'avg_correlation_penalty' in grp.columns and not grp['avg_correlation_penalty'].dropna().empty else None,
+            'technical_note': _policy_specs().get(policy_name, {}).get('technical', ''),
+            'plain_english': takeaway,
+        })
+    summary_frame = pd.DataFrame(summary_rows).sort_values('result_units', ascending=False).reset_index(drop=True)
+    return daily_frame, summary_frame
+
+
+def _build_market_realized_summary(bet_journal: pd.DataFrame):
+    if bet_journal.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    required_columns = {'report_date', 'result_units'}
+    if not required_columns.issubset(bet_journal.columns):
+        return pd.DataFrame(), pd.DataFrame()
+    work = bet_journal.copy()
+    work['report_date'] = pd.to_datetime(work.get('report_date'), errors='coerce').dt.date
+    work['result_units'] = pd.to_numeric(work.get('result_units'), errors='coerce')
+    work['stake_units'] = pd.to_numeric(work.get('stake_units'), errors='coerce').fillna(1.0)
+    work = work.dropna(subset=['report_date', 'result_units'])
+    if work.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    if 'is_settled' in work.columns:
+        settled_mask = work['is_settled'].astype(str).str.lower().isin(['1', 'true', 'yes'])
+        work = work[settled_mask | work['result_units'].notna()].copy()
+    if work.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    work['roi_pct'] = np.where(work['stake_units'].abs() > 1e-9, work['result_units'] / work['stake_units'], np.nan)
+    daily = work.groupby('report_date', dropna=True).agg(
+        bets=('result_units', 'size'),
+        stake_units=('stake_units', 'sum'),
+        result_units=('result_units', 'sum'),
+    ).reset_index()
+    daily['roi_pct'] = np.where(daily['stake_units'].abs() > 1e-9, daily['result_units'] / daily['stake_units'], np.nan)
+    summary_rows = [{
+        'settled_bets': int(len(work)),
+        'stake_units': float(work['stake_units'].sum()),
+        'result_units': float(work['result_units'].sum()),
+        'roi_pct': float(work['result_units'].sum() / work['stake_units'].sum()) if abs(float(work['stake_units'].sum())) > 1e-9 else None,
+        'avg_clv': float(pd.to_numeric(work.get('clv'), errors='coerce').dropna().mean()) if 'clv' in work.columns else None,
+        'max_drawdown_units': abs(float((daily['result_units'].cumsum() - daily['result_units'].cumsum().cummax()).min() or 0.0)),
+    }]
+    by_market = pd.DataFrame()
+    if 'market_type' in work.columns:
+        by_market = work.groupby('market_type', dropna=False).agg(
+            bets=('result_units', 'size'),
+            stake_units=('stake_units', 'sum'),
+            result_units=('result_units', 'sum'),
+        ).reset_index()
+        by_market['roi_pct'] = np.where(by_market['stake_units'].abs() > 1e-9, by_market['result_units'] / by_market['stake_units'], np.nan)
+    return pd.DataFrame(summary_rows), by_market
+
+
+def _build_market_realized_daily(bet_journal: pd.DataFrame) -> pd.DataFrame:
+    if bet_journal.empty or 'report_date' not in bet_journal.columns or 'result_units' not in bet_journal.columns:
+        return pd.DataFrame()
+    work = bet_journal.copy()
+    work['report_date'] = pd.to_datetime(work.get('report_date'), errors='coerce').dt.date
+    work['result_units'] = pd.to_numeric(work.get('result_units'), errors='coerce')
+    work['stake_units'] = pd.to_numeric(work.get('stake_units'), errors='coerce').fillna(1.0)
+    if 'clv' in work.columns:
+        work['clv'] = pd.to_numeric(work.get('clv'), errors='coerce')
+    work = work.dropna(subset=['report_date', 'result_units'])
+    if work.empty:
+        return pd.DataFrame()
+    if 'is_settled' in work.columns:
+        settled_mask = work['is_settled'].astype(str).str.lower().isin(['1', 'true', 'yes'])
+        work = work[settled_mask | work['result_units'].notna()].copy()
+    if work.empty:
+        return pd.DataFrame()
+    daily = work.groupby('report_date', dropna=True).agg(
+        bets=('result_units', 'size'),
+        stake_units=('stake_units', 'sum'),
+        result_units=('result_units', 'sum'),
+    ).reset_index()
+    if 'clv' in work.columns:
+        clv_daily = work.groupby('report_date', dropna=True)['clv'].mean().reset_index(name='avg_clv')
+        daily = daily.merge(clv_daily, on='report_date', how='left')
+    daily = daily.sort_values('report_date').reset_index(drop=True)
+    daily['roi_pct'] = np.where(daily['stake_units'].abs() > 1e-9, daily['result_units'] / daily['stake_units'], np.nan)
+    daily['cumulative_units'] = daily['result_units'].cumsum()
+    daily['rolling_peak_units'] = daily['cumulative_units'].cummax()
+    daily['drawdown_units'] = daily['cumulative_units'] - daily['rolling_peak_units']
+    return daily
+
+
+def _filter_to_window(frame: pd.DataFrame, date_col: str, window_days: int | None) -> pd.DataFrame:
+    if frame.empty or date_col not in frame.columns:
+        return pd.DataFrame()
+    work = frame.copy()
+    work[date_col] = pd.to_datetime(work[date_col], errors='coerce').dt.date
+    work = work.dropna(subset=[date_col])
+    if work.empty or window_days is None:
+        return work.sort_values(date_col).reset_index(drop=True)
+    max_date = work[date_col].max()
+    if pd.isna(max_date):
+        return work.sort_values(date_col).reset_index(drop=True)
+    start_date = max_date - dt.timedelta(days=max(int(window_days) - 1, 0))
+    return work[work[date_col] >= start_date].sort_values(date_col).reset_index(drop=True)
+
+
+def _summarize_shadow_window(shadow_daily: pd.DataFrame, window_days: int | None) -> pd.DataFrame:
+    window = _filter_to_window(shadow_daily, 'report_date', window_days)
+    if window.empty:
+        return pd.DataFrame()
+    rows = []
+    for policy_name, grp in window.groupby('policy_name', dropna=True):
+        grp = grp.sort_values('report_date').reset_index(drop=True)
+        cumulative = grp['result_units'].cumsum()
+        drawdown = cumulative - cumulative.cummax()
+        volatility_units = float(pd.to_numeric(grp['result_units'], errors='coerce').std(ddof=0) or 0.0)
+        result_units = float(grp['result_units'].sum())
+        risk_units = float(grp['risk_units'].sum())
+        max_drawdown_units = abs(float(drawdown.min() or 0.0))
+        yield_pct = (result_units / risk_units) if risk_units > 1e-9 else None
+        stability_score = result_units - (0.75 * max_drawdown_units) - (0.35 * volatility_units)
+        rows.append({
+            'policy_name': policy_name,
+            'settled_slates': int(len(grp)),
+            'settled_games': int(grp['games'].sum()) if 'games' in grp.columns else int(len(grp)),
+            'settled_picks': int(grp['picks'].sum()) if 'picks' in grp.columns else int(len(grp)),
+            'hit_rate': float(grp['hits'].sum() / grp['picks'].sum()) if 'hits' in grp.columns and float(grp['picks'].sum()) > 0 else None,
+            'risk_units': risk_units,
+            'result_units': result_units,
+            'yield_pct': yield_pct,
+            'max_drawdown_units': max_drawdown_units,
+            'worst_day_units': float(grp['result_units'].min() or 0.0),
+            'volatility_units': volatility_units,
+            'avg_daily_risk_dollars': float(grp['risk_dollars'].mean() or 0.0) if 'risk_dollars' in grp.columns else None,
+            'avg_correlation_penalty': float(grp['avg_correlation_penalty'].dropna().mean()) if 'avg_correlation_penalty' in grp.columns and not grp['avg_correlation_penalty'].dropna().empty else None,
+            'stability_score': stability_score,
+            'sample_ok': bool((len(grp) >= 3) and (int(grp['picks'].sum()) >= 10 if 'picks' in grp.columns else len(grp) >= 10)),
+        })
+    return pd.DataFrame(rows).sort_values(['stability_score', 'result_units', 'yield_pct'], ascending=[False, False, False]).reset_index(drop=True)
+
+
+def _recommend_policy_research(shadow_window: pd.DataFrame, realized_daily: pd.DataFrame, window_label: str, window_days: int | None, market_window: pd.DataFrame | None = None) -> Dict[str, Any]:
+    return policy_research.recommend_policy_research(shadow_window, realized_daily, window_label, window_days, market_window)
+
+
+def _latest_policy_research_recommendation(history: pd.DataFrame, window_label: str) -> Dict[str, Any]:
+    if history.empty:
+        return {}
+    work = history.copy()
+    if 'window_label' in work.columns:
+        filtered = work[work['window_label'].astype(str) == str(window_label)].copy()
+        if not filtered.empty:
+            work = filtered
+    if 'as_of_report_date' in work.columns:
+        work['as_of_report_date'] = pd.to_datetime(work.get('as_of_report_date'), errors='coerce')
+    sort_cols = [col for col in ['as_of_report_date', 'run_id'] if col in work.columns]
+    if sort_cols:
+        work = work.sort_values(sort_cols, ascending=[False] * len(sort_cols))
+    if work.empty:
+        return {}
+    return work.iloc[0].to_dict()
+
+
+def _policy_rankings_for_window(rankings: pd.DataFrame, window_label: str, evidence_family: str | None = None) -> pd.DataFrame:
+    if rankings.empty:
+        return pd.DataFrame()
+    work = rankings.copy()
+    if 'window_label' in work.columns:
+        work = work[work['window_label'].astype(str) == str(window_label)].copy()
+    if evidence_family is not None and 'evidence_family' in work.columns:
+        work = work[work['evidence_family'].astype(str) == str(evidence_family)].copy()
+    if work.empty:
+        return pd.DataFrame()
+    sort_cols = [col for col in ['stability_score', 'result_units', 'yield_pct'] if col in work.columns]
+    if sort_cols:
+        work = work.sort_values(sort_cols, ascending=[False] * len(sort_cols)).reset_index(drop=True)
+    return work
+
+
+def _load_bundle() -> Dict[str, Any]:
+    return quant_store.load_dashboard_bundle()
+
+
+def main() -> None:
+    st.set_page_config(page_title='MLB Quant Dashboard', layout='wide')
+    bundle = _load_bundle()
+    status = bundle.get('status') or {}
+    run_history = _frame_or_empty(bundle.get('run_history'))
+    latest_run = _frame_or_empty(bundle.get('latest_run'))
+    predictions = _frame_or_empty(bundle.get('predictions'))
+    candidates = _frame_or_empty(bundle.get('candidates'))
+    portfolio_recommendations = _frame_or_empty(bundle.get('portfolio_recommendations'))
+    portfolio_summary = _frame_or_empty(bundle.get('portfolio_summary'))
+    portfolio_market_exposure = _frame_or_empty(bundle.get('portfolio_market_exposure'))
+    portfolio_team_exposure = _frame_or_empty(bundle.get('portfolio_team_exposure'))
+    portfolio_game_exposure = _frame_or_empty(bundle.get('portfolio_game_exposure'))
+    clean_backtest = _frame_or_empty(bundle.get('clean_backtest'))
+    live_archive = _frame_or_empty(bundle.get('live_archive'))
+    bet_journal = _frame_or_empty(bundle.get('bet_journal'))
+    policy_research_history = _frame_or_empty(bundle.get('policy_research_history'))
+    policy_research_rankings = _frame_or_empty(bundle.get('policy_research_rankings'))
+    policy_research_shadow_daily = _frame_or_empty(bundle.get('policy_research_shadow_daily'))
+    policy_research_shadow_summary = _frame_or_empty(bundle.get('policy_research_shadow_summary'))
+    policy_research_market_daily = _frame_or_empty(bundle.get('policy_research_market_daily'))
+    policy_research_market_policy_daily = _frame_or_empty(bundle.get('policy_research_market_policy_daily'))
+    policy_research_market_policy_summary = _frame_or_empty(bundle.get('policy_research_market_policy_summary'))
+    policy_research_market_type_history = _frame_or_empty(bundle.get('policy_research_market_type_history'))
+    model_state = bundle.get('model_state') or {}
+
+    st.title('MLB Quant Dashboard')
+    st.caption('A portfolio-oriented layer on top of the daily MLB fair-line engine. The text betting report remains the printable output; this dashboard is the research and monitoring surface.')
+
+    with st.sidebar:
+        st.header('Data Source')
+        if status.get('duckdb_available') and status.get('db_exists'):
+            st.success('DuckDB analytics store is active.')
+            st.caption(status.get('db_path'))
+        elif status.get('duckdb_available'):
+            st.warning('DuckDB is available, but the analytics store has not been created yet. Run the daily model once after wiring the store.')
+            st.caption(status.get('db_path'))
+        else:
+            st.info('DuckDB is not available in this environment yet. The dashboard is falling back to raw source files where possible.')
+            if status.get('duckdb_error'):
+                st.caption(status.get('duckdb_error'))
+        st.markdown('Run the app with `streamlit run quant_dashboard.py`.')
+        st.markdown('Install optional dashboard dependencies from `quant_dashboard_requirements.txt`.')
+
+    latest = {} if latest_run.empty else latest_run.iloc[0].to_dict()
+    latest_report_date = str(latest.get('report_date') or (predictions['report_date'].max() if not predictions.empty and 'report_date' in predictions.columns else 'N/A'))
+    actionable_candidates = 0
+    if not portfolio_recommendations.empty and 'allocated_units' in portfolio_recommendations.columns:
+        actionable_candidates = int((pd.to_numeric(portfolio_recommendations['allocated_units'], errors='coerce').fillna(0.0) > 0).sum())
+    elif not candidates.empty and 'actionability_label' in candidates.columns:
+        actionable_candidates = int(candidates['actionability_label'].astype(str).isin(['WATCH', 'BET', 'MUST TAKE']).sum())
+
+    summary_cols = st.columns(4)
+    summary_cols[0].metric('Latest report date', latest_report_date)
+    summary_cols[1].metric('Latest phase', str(latest.get('phase') or model_state.get('season_phase', 'N/A')).title())
+    summary_cols[2].metric('Slate size', int(latest.get('prediction_count') or len(predictions) or 0))
+    summary_cols[3].metric('Actionable candidates', actionable_candidates)
+
+    tabs = st.tabs(['Overview', 'Slate', 'Portfolio', 'Validation', 'Research'])
+
+    with tabs[0]:
+        st.subheader('Run Overview')
+        metric_cols = st.columns(4)
+        metric_cols[0].metric('Research OOS log loss', _fmt_num(latest.get('validation_log_loss'), 4))
+        metric_cols[1].metric('Research OOS accuracy', _fmt_pct(latest.get('validation_accuracy')))
+        metric_cols[2].metric('Live settled log loss', _fmt_num(latest.get('live_validation_log_loss'), 4))
+        metric_cols[3].metric('Live settled accuracy', _fmt_pct(latest.get('live_validation_accuracy')))
+
+        metric_cols2 = st.columns(4)
+        metric_cols2[0].metric('Research totals RMSE', _fmt_num(latest.get('validation_total_rmse'), 3))
+        metric_cols2[1].metric('Research margin RMSE', _fmt_num(latest.get('validation_margin_rmse'), 3))
+        metric_cols2[2].metric('Settled live games', int(latest.get('live_validation_games') or 0))
+        metric_cols2[3].metric('Settled live days', int(latest.get('live_validation_settled_days') or 0))
+        st.caption('Research OOS comes from the clean replay baseline and only changes when that replay is rebuilt. Live settled comes from archived real predictions after games finish, so it should move day by day.')
+        market_policy_frame = _market_policy_overview_frame(latest)
+        if not market_policy_frame.empty:
+            st.markdown('**Market Policy Snapshot**')
+            policy_cols = st.columns(4)
+            policy_cols[0].metric('Market policy status', str(latest.get('market_policy_alignment_status') or 'N/A'))
+            policy_cols[1].metric('Real-market markets', f"{int(latest.get('market_policy_real_market_count') or 0)}/3")
+            policy_cols[2].metric('Policy changes vs prior run', int(latest.get('market_policy_change_count') or 0))
+            strength_mix = f"H {int(latest.get('market_policy_high_strength_count') or 0)} | M {int(latest.get('market_policy_medium_strength_count') or 0)} | L {int(latest.get('market_policy_low_strength_count') or 0)}"
+            policy_cols[3].metric('Evidence mix', strength_mix)
+            technical_note = str(latest.get('market_policy_summary_technical') or '').strip()
+            plain_note = str(latest.get('market_policy_summary_plain_english') or '').strip()
+            snapshot_note = str(latest.get('market_policy_market_snapshot') or '').strip()
+            if plain_note:
+                st.write(f"Plain English: {plain_note}")
+            if technical_note:
+                st.caption(f"Technical: {technical_note}")
+            if snapshot_note:
+                st.caption(snapshot_note)
+            st.dataframe(market_policy_frame, use_container_width=True, hide_index=True)
+        else:
+            st.info('Market-aware policy status will appear here once the stored run summary includes per-market recommendation fields.')
+
+        if not run_history.empty:
+            history = run_history.copy()
+            history['report_date'] = pd.to_datetime(history['report_date'], errors='coerce')
+            left, right = st.columns(2)
+            with left:
+                _render_line_chart(history.sort_values('report_date'), 'report_date', 'validation_log_loss', 'Research Moneyline OOS Log Loss')
+            with right:
+                live_history = history.sort_values('report_date')
+                if 'live_validation_log_loss' in live_history.columns and pd.to_numeric(live_history['live_validation_log_loss'], errors='coerce').notna().any():
+                    _render_line_chart(live_history, 'report_date', 'live_validation_log_loss', 'Live Settled Moneyline Log Loss')
+                else:
+                    _render_line_chart(live_history, 'report_date', 'validation_total_rmse', 'Research Totals OOS RMSE')
+            left, right = st.columns(2)
+            with left:
+                weight_frame = pd.DataFrame([
+                    {'weight': 'offense', 'value': latest.get('w_off')},
+                    {'weight': 'starter', 'value': latest.get('w_starter')},
+                    {'weight': 'bullpen', 'value': latest.get('w_bullpen')},
+                    {'weight': 'park', 'value': latest.get('w_park')},
+                    {'weight': 'weather', 'value': latest.get('w_weather')},
+                    {'weight': 'context', 'value': latest.get('w_context')},
+                    {'weight': 'home_field', 'value': latest.get('home_field')},
+                ]).dropna()
+                _render_bar_chart(weight_frame, 'weight', 'value', 'Active Weight Profile')
+            with right:
+                shrink_frame = pd.DataFrame([
+                    {'signal': 'probability', 'alpha': latest.get('probability_shrink_alpha')},
+                    {'signal': 'total', 'alpha': latest.get('total_shrink_alpha')},
+                    {'signal': 'margin', 'alpha': latest.get('margin_shrink_alpha')},
+                ]).fillna(0.0)
+                _render_bar_chart(shrink_frame, 'signal', 'alpha', 'Current Shrinkage Alphas')
+        else:
+            st.info('Run history will appear here once the DuckDB analytics store has multiple snapshots.')
+
+    with tabs[1]:
+        st.subheader('Slate View')
+        if predictions.empty:
+            st.info('No latest-slate prediction snapshot is available yet.')
+        else:
+            slate = predictions.copy()
+            confidence_options = ['All'] + sorted([str(value) for value in slate.get('confidence_tier', pd.Series(dtype=str)).dropna().unique().tolist()])
+            selected_confidence = st.selectbox('Confidence filter', confidence_options, index=0)
+            if selected_confidence != 'All' and 'confidence_tier' in slate.columns:
+                slate = slate[slate['confidence_tier'].astype(str) == selected_confidence].copy()
+            if 'margin_calibrated' in slate.columns:
+                margin_size = pd.to_numeric(slate['margin_calibrated'], errors='coerce').abs().fillna(0.0)
+                slate['margin_size'] = margin_size.clip(lower=0.05)
+            display_cols = [
+                col for col in [
+                    'away_team', 'home_team', 'winner', 'winner_prob', 'confidence_tier', 'fair_away_ml', 'fair_home_ml',
+                    'total_calibrated', 'margin_calibrated', 'probability_shrink_alpha', 'total_shrink_alpha', 'margin_shrink_alpha',
+                    'away_lineup_count', 'home_lineup_count', 'market_label', 'sportsbook_count'
+                ] if col in slate.columns
+            ]
+            st.dataframe(slate[display_cols].sort_values(['winner_prob', 'total_calibrated'], ascending=[False, False]), use_container_width=True, hide_index=True)
+            if px is not None and {'winner_prob', 'total_calibrated', 'confidence_tier'}.issubset(slate.columns):
+                scatter = px.scatter(
+                    slate,
+                    x='winner_prob',
+                    y='total_calibrated',
+                    color='confidence_tier',
+                    size='margin_size' if 'margin_size' in slate.columns else None,
+                    hover_data=['away_team', 'home_team', 'winner'],
+                    title='Latest Slate Probability vs Total Map',
+                )
+                st.plotly_chart(scatter, use_container_width=True)
+
+    with tabs[2]:
+        st.subheader('Portfolio View')
+        if portfolio_summary.empty and portfolio_recommendations.empty and candidates.empty and live_archive.empty and bet_journal.empty:
+            st.info('No portfolio plan is stored yet. This will populate once market lines exist and the model creates actionable candidates.')
+        else:
+            summary_row = {} if portfolio_summary.empty else portfolio_summary.iloc[0].to_dict()
+            phase_name = str((summary_row.get('phase') if summary_row else None) or latest.get('phase') or model_state.get('season_phase') or 'spring').lower()
+            default_unit_risk_pct = round(((_safe_float(summary_row.get('base_unit_risk_pct')) if summary_row else None) or (0.0075 if phase_name == 'spring' else 0.01)) * 100.0, 2)
+            if summary_row:
+                portfolio_cols = st.columns(4)
+                portfolio_cols[0].metric('Daily budget', f"{_safe_float(summary_row.get('daily_budget_units')) or 0.0:.2f}u")
+                portfolio_cols[1].metric('Raw demand', f"{_safe_float(summary_row.get('raw_demand_units')) or 0.0:.2f}u")
+                portfolio_cols[2].metric('Allocated units', f"{_safe_float(summary_row.get('allocated_units')) or 0.0:.2f}u")
+                portfolio_cols[3].metric('Utilization', _fmt_pct(summary_row.get('utilization_pct')))
+
+                top_cols = st.columns(4)
+                top_cols[0].metric('Allocated plays', int(summary_row.get('allocated_candidate_count') or 0))
+                top_cols[1].metric('WATCH / BET / MUST', f"{int(summary_row.get('watch_count') or 0)} / {int(summary_row.get('bet_count') or 0)} / {int(summary_row.get('must_take_count') or 0)}")
+                top_cols[2].metric('Per-game cap', f"{_safe_float(summary_row.get('max_game_units')) or 0.0:.2f}u")
+                top_cols[3].metric('Per-team cap', f"{_safe_float(summary_row.get('max_team_units')) or 0.0:.2f}u")
+
+                corr_cols = st.columns(4)
+                corr_cols[0].metric('Correlated candidates', int(summary_row.get('correlated_candidate_count') or 0))
+                corr_cols[1].metric('Avg corr penalty', _fmt_num(summary_row.get('avg_correlation_penalty'), 3))
+                corr_cols[2].metric('Largest game concentration', _fmt_pct(summary_row.get('largest_game_exposure_pct')) )
+                corr_cols[3].metric('Largest team concentration', _fmt_pct(summary_row.get('largest_team_exposure_pct')) )
+            else:
+                st.info('Portfolio summary is not available yet, so this view is falling back to raw candidates.')
+
+            control_cols = st.columns(4)
+            bankroll = control_cols[0].number_input('Sim bankroll ($)', min_value=100.0, value=5000.0, step=100.0, key='portfolio_bankroll')
+            unit_risk_pct = control_cols[1].number_input('1u risk (%)', min_value=0.10, value=float(default_unit_risk_pct), step=0.05, key='portfolio_unit_pct')
+            selected_policy = control_cols[2].selectbox('Sizing policy', list(_policy_specs().keys()), index=2, key='portfolio_policy')
+            selected_posture = control_cols[3].selectbox('Risk posture', list(_risk_posture_specs().keys()), index=1, key='portfolio_posture')
+            deployment_scalar = st.slider('Manual deployment override', min_value=0.25, max_value=1.50, value=1.00, step=0.05, key='portfolio_deployment_scalar')
+
+            policy_recommendation_view, policy_summary, policy_market_exposure, policy_team_exposure, policy_game_exposure = _apply_policy_to_recommendations(
+                summary_row,
+                portfolio_recommendations,
+                selected_policy,
+                selected_posture,
+                bankroll,
+                unit_risk_pct,
+                deployment_scalar,
+            )
+            unit_size_dollars = float(_safe_float(policy_summary.get('unit_size_dollars')) or 0.0)
+            deployed_risk_dollars = float(_safe_float(policy_summary.get('deployed_risk_dollars')) or 0.0)
+            expected_value_dollars = float(_safe_float(policy_summary.get('expected_value_dollars')) or 0.0)
+            max_loss_dollars = float(_safe_float(policy_summary.get('max_loss_dollars')) or 0.0)
+            game_risk_dollars = float(_safe_float(policy_summary.get('game_risk_dollars')) or 0.0)
+            team_risk_dollars = float(_safe_float(policy_summary.get('team_risk_dollars')) or 0.0)
+
+            sim_metrics = st.columns(5)
+            sim_metrics[0].metric('Unit size (technical: 1u risk)', f"${unit_size_dollars:,.2f}")
+            sim_metrics[1].metric('Deployed risk (capital at risk)', f"${deployed_risk_dollars:,.2f}")
+            sim_metrics[2].metric('Expected value (long-run edge)', f"${expected_value_dollars:,.2f}")
+            sim_metrics[3].metric('Worst-case day (max one-day loss)', f"-${max_loss_dollars:,.2f}")
+            sim_metrics[4].metric('Top game / team risk (concentration)', f"${game_risk_dollars:,.2f} / ${team_risk_dollars:,.2f}")
+
+            st.caption(
+                'Technical policy note: ' + str(policy_summary.get('policy_description') or 'No policy description is available.') +
+                ' Plain English: ' + str(policy_summary.get('plain_english') or 'No plain-English explanation is available.')
+            )
+            plain_english_summary = _portfolio_plain_english(
+                summary_row.get('utilization_pct') if summary_row else None,
+                summary_row.get('correlated_candidate_count') if summary_row else 0,
+                summary_row.get('largest_game_exposure_pct') if summary_row else None,
+                summary_row.get('largest_team_exposure_pct') if summary_row else None,
+            )
+            st.caption('Slate concentration summary: ' + plain_english_summary)
+
+            scenario_frame = _build_portfolio_scenarios(
+                summary_row,
+                portfolio_recommendations,
+                bankroll,
+                unit_risk_pct,
+                deployment_scalar,
+                selected_posture,
+            )
+            st.markdown('**Policy ladder**')
+            st.caption('Technical: this compares the three sizing policies at the selected risk posture. Plain English: it shows how the same slate would feel under simple, edge-sensitive, and risk-capped money management.')
+            if not scenario_frame.empty:
+                scenario_display = scenario_frame.copy()
+                scenario_display['technical view'] = scenario_display['technical_note']
+                scenario_display['plain-English view'] = scenario_display['plain_english']
+                st.dataframe(
+                    scenario_display[[
+                        'scenario', 'unit_risk_pct', 'deployment_scalar', 'unit_size_dollars', 'deployed_risk_dollars',
+                        'expected_value_dollars', 'max_loss_dollars', 'game_risk_dollars', 'team_risk_dollars',
+                        'avg_correlation_penalty', 'technical view', 'plain-English view'
+                    ]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                if px is not None:
+                    scenario_chart = scenario_frame.melt(
+                        id_vars='scenario',
+                        value_vars=['deployed_risk_dollars', 'expected_value_dollars', 'max_loss_dollars'],
+                        var_name='metric',
+                        value_name='dollars',
+                    )
+                    st.plotly_chart(
+                        px.bar(
+                            scenario_chart,
+                            x='scenario',
+                            y='dollars',
+                            color='metric',
+                            barmode='group',
+                            title='Policy Comparison: Risk, EV, and Worst-Case Loss',
+                        ),
+                        use_container_width=True,
+                    )
+            else:
+                st.info('Policy analysis will populate once the allocator has active positions to size.')
+
+            with st.expander('How to read this panel', expanded=False):
+                st.markdown(
+                    """
+- `Unit size (technical: 1u risk)`: the dollar value of one model unit. In plain English, this is how much you lose if a 1-unit bet loses.
+- `Deployed risk`: total dollars currently committed across the slate. In plain English, this is your money in action today.
+- `Expected value`: the model's long-run profit estimate if these prices are real edges. In plain English, this is the amount the model expects to earn on average over many slates, not a promise for today.
+- `Worst-case day`: the loss if every allocated position loses. In plain English, this is the bad-day stress test.
+- `Sizing policy`: the rule set that converts model conviction into stake size. In plain English, this controls whether the app sizes everything evenly, leans into stronger edges, or leans into them while capping concentration harder.
+- `Risk posture`: the overall throttle on the whole slate. In plain English, this is your cautious / normal / aggressive dial.
+- `Correlation penalty`: the trim applied when multiple bets depend on the same game or team. In plain English, the model avoids overloading one story.
+                    """
+                )
+
+            exposure_left, exposure_right = st.columns(2)
+            with exposure_left:
+                if not policy_market_exposure.empty:
+                    _render_bar_chart(policy_market_exposure, 'bucket', 'policy_risk_dollars', 'Allocated Risk by Market ($)')
+                elif not candidates.empty:
+                    by_market = candidates.groupby('market_type', dropna=False)['suggested_units_preview'].sum().reset_index()
+                    _render_bar_chart(by_market, 'market_type', 'suggested_units_preview', 'Suggested Units by Market')
+                else:
+                    st.info('No market exposure data is available yet.')
+            with exposure_right:
+                if not policy_team_exposure.empty:
+                    _render_bar_chart(policy_team_exposure.head(10), 'bucket', 'policy_risk_dollars', 'Top Team Exposure ($)')
+                elif not candidates.empty:
+                    by_label = candidates.groupby('actionability_label', dropna=False)['suggested_units_preview'].sum().reset_index()
+                    _render_bar_chart(by_label, 'actionability_label', 'suggested_units_preview', 'Suggested Units by Actionability')
+                else:
+                    st.info('No team exposure data is available yet.')
+
+            exposure_left, exposure_right = st.columns(2)
+            with exposure_left:
+                if not policy_game_exposure.empty:
+                    _render_bar_chart(policy_game_exposure.head(10), 'bucket', 'policy_risk_dollars', 'Top Game Exposure ($)')
+                else:
+                    st.info('No game-level exposure data is available yet.')
+            with exposure_right:
+                if not policy_recommendation_view.empty and {'market_type', 'allocated_units', 'policy_units'}.issubset(policy_recommendation_view.columns):
+                    demand_compare = policy_recommendation_view.groupby('market_type', dropna=False)[['allocated_units', 'policy_units']].sum().reset_index()
+                    if px is not None:
+                        melted = demand_compare.melt(id_vars='market_type', value_vars=['allocated_units', 'policy_units'], var_name='measure', value_name='units')
+                        st.plotly_chart(px.bar(melted, x='market_type', y='units', color='measure', barmode='group', title='Base Allocation vs Policy Allocation'), use_container_width=True)
+                    else:
+                        st.dataframe(demand_compare, use_container_width=True, hide_index=True)
+                else:
+                    st.info('Base-versus-policy allocation comparison will appear once a portfolio plan exists.')
+
+            if not policy_recommendation_view.empty:
+                if px is not None and {'expected_value_per_unit', 'policy_units', 'market_type'}.issubset(policy_recommendation_view.columns):
+                    bubble = px.scatter(
+                        policy_recommendation_view,
+                        x='expected_value_per_unit',
+                        y='policy_units',
+                        color='market_type',
+                        size='actionability_score' if 'actionability_score' in policy_recommendation_view.columns else None,
+                        hover_data=['away_team', 'home_team', 'selection', 'policy_note', 'cap_notes'],
+                        title='Policy-Adjusted Portfolio Recommendations',
+                    )
+                    st.plotly_chart(bubble, use_container_width=True)
+                table_cols = [
+                    col for col in [
+                        'away_team', 'home_team', 'market_type', 'selection', 'allocated_units', 'policy_units', 'policy_risk_dollars',
+                        'policy_expected_value_dollars', 'expected_value_per_unit', 'edge_value', 'actionability_label', 'actionability_score',
+                        'same_game_peer_count', 'same_team_peer_count', 'final_correlation_penalty', 'policy_factor', 'confidence_tier',
+                        'policy_note', 'cap_notes'
+                    ] if col in policy_recommendation_view.columns
+                ]
+                st.dataframe(
+                    policy_recommendation_view[table_cols].sort_values(['policy_units', 'expected_value_per_unit'], ascending=[False, False]),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            elif not candidates.empty:
+                st.info('No policy-adjusted allocation was produced on this run, so the table below shows raw candidates instead.')
+                table_cols = [
+                    col for col in [
+                        'away_team', 'home_team', 'market_type', 'selection', 'book_price', 'edge_value', 'expected_value_per_unit',
+                        'actionability_label', 'actionability_score', 'suggested_units_preview', 'confidence_tier'
+                    ] if col in candidates.columns
+                ]
+                st.dataframe(candidates[table_cols].sort_values(['suggested_units_preview', 'candidate_score'], ascending=[False, False]), use_container_width=True, hide_index=True)
+
+            st.markdown('**Historical policy simulator**')
+            st.caption('Technical: this replays archived settled main-side predictions as even-money normalized shadow positions, then applies the same sizing rules you chose above. Plain English: it shows which bankroll style would have felt smoother or more aggressive if you had followed the model through the archive.')
+            shadow_daily, shadow_summary = _build_shadow_policy_backtest(
+                live_archive,
+                bankroll,
+                unit_risk_pct,
+                deployment_scalar,
+                selected_posture,
+            )
+            if not shadow_summary.empty:
+                selected_shadow = shadow_summary[shadow_summary['policy_name'] == selected_policy].head(1)
+                if not selected_shadow.empty:
+                    shadow_row = selected_shadow.iloc[0]
+                    shadow_cols = st.columns(5)
+                    shadow_cols[0].metric('Shadow P&L (units)', _fmt_num(shadow_row.get('result_units'), 2))
+                    shadow_cols[1].metric('Shadow yield', _fmt_pct(shadow_row.get('yield_pct')))
+                    shadow_cols[2].metric('Max drawdown', _fmt_num(shadow_row.get('max_drawdown_units'), 2) + 'u')
+                    shadow_cols[3].metric('Settled picks', int(shadow_row.get('settled_picks') or 0))
+                    shadow_cols[4].metric('Hit rate', _fmt_pct(shadow_row.get('hit_rate')))
+                    st.caption('Selected policy read: ' + str(shadow_row.get('technical_note') or '') + ' Plain English: ' + str(shadow_row.get('plain_english') or ''))
+                shadow_display = shadow_summary.copy()
+                shadow_display['technical view'] = shadow_display['technical_note']
+                shadow_display['plain-English view'] = shadow_display['plain_english']
+                st.dataframe(
+                    shadow_display[[
+                        'policy_name', 'posture_name', 'settled_slates', 'settled_picks', 'hit_rate', 'risk_units',
+                        'result_units', 'yield_pct', 'max_drawdown_units', 'avg_daily_risk_dollars', 'technical view', 'plain-English view'
+                    ]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                shadow_left, shadow_right = st.columns(2)
+                with shadow_left:
+                    if px is not None:
+                        st.plotly_chart(
+                            px.line(shadow_daily, x='report_date', y='cumulative_units', color='policy_name', title='Shadow Policy Equity Curve (Units)'),
+                            use_container_width=True,
+                        )
+                    else:
+                        st.dataframe(shadow_daily[['report_date', 'policy_name', 'cumulative_units']], use_container_width=True, hide_index=True)
+                with shadow_right:
+                    if px is not None:
+                        dd_chart = shadow_summary.melt(
+                            id_vars='policy_name',
+                            value_vars=['result_units', 'max_drawdown_units'],
+                            var_name='metric',
+                            value_name='units',
+                        )
+                        st.plotly_chart(
+                            px.bar(dd_chart, x='policy_name', y='units', color='metric', barmode='group', title='Shadow Return vs Drawdown'),
+                            use_container_width=True,
+                        )
+                    else:
+                        st.dataframe(shadow_summary[['policy_name', 'result_units', 'max_drawdown_units']], use_container_width=True, hide_index=True)
+            else:
+                st.info('The shadow policy simulator needs settled archived predictions. It will populate automatically as the live archive grows.')
+
+            st.markdown('**Real-market alternate policy replay**')
+            st.caption('Technical: this replays settled priced journal bets under Flat, Fractional Kelly Proxy, and Risk-Capped Hybrid using the actual market prices and graded outcomes. Plain English: it shows how each bankroll style would have performed on the real bets, not just on shadow picks.')
+            market_policy_daily_live, market_policy_summary_live = policy_research.build_market_policy_backtest(
+                bet_journal,
+                bankroll,
+                unit_risk_pct,
+                deployment_scalar,
+                selected_posture,
+            )
+            if not market_policy_summary_live.empty:
+                selected_market = market_policy_summary_live[market_policy_summary_live['policy_name'] == selected_policy].head(1)
+                if not selected_market.empty:
+                    market_row = selected_market.iloc[0]
+                    market_cols = st.columns(5)
+                    market_cols[0].metric('Real-market P&L (units)', _fmt_num(market_row.get('result_units'), 2))
+                    market_cols[1].metric('Real-market yield', _fmt_pct(market_row.get('yield_pct')))
+                    market_cols[2].metric('Max drawdown', _fmt_num(market_row.get('max_drawdown_units'), 2) + 'u')
+                    market_cols[3].metric('Settled priced bets', int(market_row.get('settled_picks') or 0))
+                    market_cols[4].metric('Average CLV', _fmt_num(market_row.get('avg_clv'), 3))
+                    st.caption('Selected real-market read: ' + str(market_row.get('technical_note') or '') + ' Plain English: ' + str(market_row.get('plain_english') or ''))
+                market_display = market_policy_summary_live.copy()
+                market_display['technical view'] = market_display['technical_note']
+                market_display['plain-English view'] = market_display['plain_english']
+                st.dataframe(
+                    market_display[[
+                        'policy_name', 'posture_name', 'settled_slates', 'settled_picks', 'hit_rate', 'risk_units',
+                        'result_units', 'yield_pct', 'max_drawdown_units', 'avg_clv', 'avg_daily_risk_dollars',
+                        'technical view', 'plain-English view'
+                    ]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                market_left, market_right = st.columns(2)
+                with market_left:
+                    if px is not None:
+                        st.plotly_chart(
+                            px.line(market_policy_daily_live, x='report_date', y='cumulative_units', color='policy_name', title='Real-Market Alternate Policy Equity Curve (Units)'),
+                            use_container_width=True,
+                        )
+                    else:
+                        st.dataframe(market_policy_daily_live[['report_date', 'policy_name', 'cumulative_units']], use_container_width=True, hide_index=True)
+                with market_right:
+                    if px is not None:
+                        market_dd_chart = market_policy_summary_live.melt(
+                            id_vars='policy_name',
+                            value_vars=['result_units', 'max_drawdown_units'],
+                            var_name='metric',
+                            value_name='units',
+                        )
+                        st.plotly_chart(
+                            px.bar(market_dd_chart, x='policy_name', y='units', color='metric', barmode='group', title='Real-Market Return vs Drawdown by Policy'),
+                            use_container_width=True,
+                        )
+                    else:
+                        st.dataframe(market_policy_summary_live[['policy_name', 'result_units', 'max_drawdown_units']], use_container_width=True, hide_index=True)
+            else:
+                st.info('Real-market alternate replay will populate once settled priced bets exist in the journal.')
+
+            st.markdown('**Policy research recommendation**')
+            st.caption('Technical: this block ranks bankroll policies over a rolling settled window, using real-market alternate-policy replay first when enough priced bets exist. Plain English: it tells you which style currently looks most trustworthy, and whether you should stay cautious or lean in.')
+            window_options = {
+                'Last 7 settled days': 7,
+                'Last 14 settled days': 14,
+                'Last 30 settled days': 30,
+                'All settled history': None,
+            }
+            selected_window_label = st.selectbox('Policy research window', list(window_options.keys()), index=1, key='policy_research_window')
+            selected_window_days = window_options[selected_window_label]
+            canonical_shadow_daily = policy_research_shadow_daily if not policy_research_shadow_daily.empty else shadow_daily
+            canonical_market_policy_daily = policy_research_market_policy_daily if not policy_research_market_policy_daily.empty else market_policy_daily_live
+            shadow_window = _policy_rankings_for_window(policy_research_rankings, selected_window_label, 'shadow')
+            if shadow_window.empty:
+                shadow_window = _summarize_shadow_window(canonical_shadow_daily, selected_window_days)
+            market_policy_window = _policy_rankings_for_window(policy_research_rankings, selected_window_label, 'real_market')
+            if market_policy_window.empty:
+                market_policy_window = _summarize_shadow_window(canonical_market_policy_daily, selected_window_days)
+            realized_daily = policy_research_market_daily if not policy_research_market_daily.empty else _build_market_realized_daily(bet_journal)
+            policy_research_recommendation = _latest_policy_research_recommendation(policy_research_history, selected_window_label)
+            if not policy_research_recommendation:
+                policy_research_recommendation = _recommend_policy_research(
+                    shadow_window,
+                    realized_daily,
+                    selected_window_label,
+                    selected_window_days,
+                    market_policy_window,
+                )
+            st.caption('Research mode: canonical persisted policy research uses real-market replay first when enough priced bets exist, then falls back to shadow evidence. The live replay blocks above remain posture-specific what-if views.')
+            rec_cols = st.columns(4)
+            rec_cols[0].metric('Recommended policy', str(policy_research_recommendation.get('policy_name') or 'N/A'))
+            rec_cols[1].metric('Recommended posture', str(policy_research_recommendation.get('posture_name') or 'N/A'))
+            rec_cols[2].metric('Evidence source', str(policy_research_recommendation.get('evidence_source') or 'N/A'))
+            rec_cols[3].metric('Evidence strength', str(policy_research_recommendation.get('evidence_strength') or 'N/A'))
+            st.caption('Technical read: ' + str(policy_research_recommendation.get('technical_note') or 'No research note is available yet.'))
+            st.caption('Plain English: ' + str(policy_research_recommendation.get('plain_english') or 'No plain-English recommendation is available yet.'))
+            takeover_status = policy_research.market_policy_takeover_status(market_policy_window, policy_research_recommendation)
+            trigger_cols = st.columns(4)
+            trigger_cols[0].metric('Real-market priced bets', int(takeover_status.get('current_picks') or 0))
+            trigger_cols[1].metric('Real-market settled days', int(takeover_status.get('current_slates') or 0))
+            trigger_cols[2].metric('To market takeover', f"{int(takeover_status.get('remaining_medium_slates') or 0)} day(s) | {int(takeover_status.get('remaining_medium_picks') or 0)} bets")
+            trigger_cols[3].metric('To high-confidence market', f"{int(takeover_status.get('remaining_high_slates') or 0)} day(s) | {int(takeover_status.get('remaining_high_picks') or 0)} bets")
+            st.caption('Technical trigger summary: primary takeover unlocks at ' + str(takeover_status.get('medium_threshold_label') or 'N/A') + ', and high-confidence market proof unlocks at ' + str(takeover_status.get('high_threshold_label') or 'N/A') + '.')
+            st.caption('Plain English takeover read: ' + str(takeover_status.get('plain_english') or 'No takeover guidance is available yet.'))
+            market_type_takeover = policy_research.market_type_takeover_status(bet_journal, selected_window_days)
+            st.markdown('**Market-type takeover progress**')
+            st.caption('Technical: this breaks real-market readiness out by moneyline, total, and run line. Plain English: it shows which betting markets are actually building enough settled priced-bet history to take over from shadow evidence first.')
+            if not market_type_takeover.empty:
+                takeover_display = market_type_takeover.copy()
+                takeover_display['Primary ready'] = takeover_display['primary_ready'].map(lambda value: 'Yes' if bool(value) else 'No')
+                takeover_display['High-confidence ready'] = takeover_display['high_ready'].map(lambda value: 'Yes' if bool(value) else 'No')
+                takeover_display['To takeover'] = takeover_display['remaining_medium_slates'].astype(int).astype(str) + ' day(s) | ' + takeover_display['remaining_medium_picks'].astype(int).astype(str) + ' bets'
+                takeover_display['To high-confidence'] = takeover_display['remaining_high_slates'].astype(int).astype(str) + ' day(s) | ' + takeover_display['remaining_high_picks'].astype(int).astype(str) + ' bets'
+                st.dataframe(
+                    takeover_display[[
+                        'market_label', 'current_slates', 'current_picks', 'Primary ready', 'High-confidence ready',
+                        'To takeover', 'To high-confidence', 'avg_clv', 'plain_english'
+                    ]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                if px is not None:
+                    progress_chart = takeover_display.melt(
+                        id_vars='market_label',
+                        value_vars=['current_picks'],
+                        var_name='metric',
+                        value_name='value',
+                    )
+                    st.plotly_chart(
+                        px.bar(progress_chart, x='market_label', y='value', color='metric', title='Settled Priced Bets by Market Type'),
+                        use_container_width=True,
+                    )
+            market_specific_history_window = pd.DataFrame()
+            if not policy_research_market_type_history.empty:
+                market_specific_history_window = policy_research_market_type_history.copy()
+                if 'window_label' in market_specific_history_window.columns:
+                    market_specific_history_window = market_specific_history_window[market_specific_history_window['window_label'].astype(str) == str(selected_window_label)].copy()
+                if 'as_of_report_date' in market_specific_history_window.columns:
+                    market_specific_history_window['as_of_report_date'] = pd.to_datetime(market_specific_history_window.get('as_of_report_date'), errors='coerce')
+                sort_cols = [col for col in ['as_of_report_date', 'run_id'] if col in market_specific_history_window.columns]
+                if sort_cols:
+                    market_specific_history_window = market_specific_history_window.sort_values(sort_cols, ascending=[False] * len(sort_cols))
+            if not market_specific_history_window.empty:
+                market_specific_recs = market_specific_history_window.drop_duplicates(subset=['market_type'], keep='first').reset_index(drop=True)
+            else:
+                market_specific_recs = policy_research.market_specific_policy_recommendations(
+                    bet_journal,
+                    shadow_window,
+                    selected_window_label,
+                    selected_window_days,
+                    phase_name,
+                )
+            st.markdown('**Market-aware policy recommendations**')
+            st.caption('Technical: this recommends a bankroll style separately for moneyline, total, and run line using that market\'s own evidence path. Plain English: each betting market can now earn a different sizing style instead of sharing one global answer.')
+            if not market_specific_recs.empty:
+                market_specific_display = market_specific_recs.copy()
+                market_specific_display['To takeover'] = market_specific_display['remaining_medium_slates'].astype(int).astype(str) + ' day(s) | ' + market_specific_display['remaining_medium_picks'].astype(int).astype(str) + ' bets'
+                market_specific_display['To high-confidence'] = market_specific_display['remaining_high_slates'].astype(int).astype(str) + ' day(s) | ' + market_specific_display['remaining_high_picks'].astype(int).astype(str) + ' bets'
+                st.dataframe(
+                    market_specific_display[[
+                        'market_label', 'recommended_policy', 'recommended_posture', 'evidence_source', 'evidence_strength',
+                        'current_slates', 'current_picks', 'To takeover', 'To high-confidence', 'plain_english'
+                    ]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                if not market_specific_history_window.empty:
+                    st.markdown('**Market-aware recommendation drift**')
+                    st.caption('Technical: this tracks how each market\'s preferred policy has changed across exports for the selected research window. Plain English: it shows whether moneyline, totals, or run line are starting to trust different bankroll styles over time.')
+                    if px is not None:
+                        drift_market = market_specific_history_window.dropna(subset=['as_of_report_date']).copy()
+                        if not drift_market.empty:
+                            st.plotly_chart(
+                                px.scatter(
+                                    drift_market,
+                                    x='as_of_report_date',
+                                    y='recommended_policy',
+                                    color='market_label',
+                                    symbol='evidence_strength',
+                                    hover_data=['recommended_posture', 'evidence_source', 'plain_english'],
+                                    title='Market-Aware Policy Recommendation Drift',
+                                ),
+                                use_container_width=True,
+                            )
+                    drift_cols = [
+                        col for col in [
+                            'as_of_report_date', 'market_label', 'recommended_policy', 'recommended_posture',
+                            'evidence_source', 'evidence_strength', 'plain_english'
+                        ] if col in market_specific_history_window.columns
+                    ]
+                    if drift_cols:
+                        st.dataframe(market_specific_history_window[drift_cols].sort_values('as_of_report_date', ascending=False), use_container_width=True, hide_index=True)
+            if not shadow_window.empty:
+                research_display = shadow_window.copy()
+                research_display['sample ready'] = research_display['sample_ok'].map(lambda value: 'Yes' if bool(value) else 'No')
+                st.dataframe(
+                    research_display[[
+                        'policy_name', 'settled_slates', 'settled_picks', 'hit_rate', 'result_units', 'yield_pct',
+                        'max_drawdown_units', 'volatility_units', 'stability_score', 'sample ready'
+                    ]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                filtered_shadow = _filter_to_window(canonical_shadow_daily, 'report_date', selected_window_days)
+                if not filtered_shadow.empty:
+                    research_left, research_right = st.columns(2)
+                    with research_left:
+                        if px is not None:
+                            st.plotly_chart(
+                                px.line(filtered_shadow, x='report_date', y='cumulative_units', color='policy_name', title='Windowed Shadow Bankroll Path (Units)'),
+                                use_container_width=True,
+                            )
+                        else:
+                            st.dataframe(filtered_shadow[['report_date', 'policy_name', 'cumulative_units']], use_container_width=True, hide_index=True)
+                    with research_right:
+                        if px is not None:
+                            drawdown_chart = filtered_shadow.copy()
+                            st.plotly_chart(
+                                px.line(drawdown_chart, x='report_date', y='drawdown_units', color='policy_name', title='Windowed Shadow Drawdown (Units)'),
+                                use_container_width=True,
+                            )
+                        else:
+                            st.dataframe(filtered_shadow[['report_date', 'policy_name', 'drawdown_units']], use_container_width=True, hide_index=True)
+            else:
+                st.info('The shadow policy research table needs more settled archive rows before it can rank the bankroll styles.')
+
+            if not market_policy_window.empty:
+                market_window_display = market_policy_window.copy()
+                market_window_display['sample ready'] = market_window_display['sample_ok'].map(lambda value: 'Yes' if bool(value) else 'No')
+                st.dataframe(
+                    market_window_display[[
+                        'policy_name', 'settled_slates', 'settled_picks', 'hit_rate', 'result_units', 'yield_pct',
+                        'max_drawdown_units', 'avg_clv', 'volatility_units', 'stability_score', 'sample ready'
+                    ]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                filtered_market = _filter_to_window(canonical_market_policy_daily, 'report_date', selected_window_days)
+                if not filtered_market.empty:
+                    market_window_left, market_window_right = st.columns(2)
+                    with market_window_left:
+                        if px is not None:
+                            st.plotly_chart(
+                                px.line(filtered_market, x='report_date', y='cumulative_units', color='policy_name', title='Windowed Real-Market Policy Bankroll Path (Units)'),
+                                use_container_width=True,
+                            )
+                        else:
+                            st.dataframe(filtered_market[['report_date', 'policy_name', 'cumulative_units']], use_container_width=True, hide_index=True)
+                    with market_window_right:
+                        if px is not None:
+                            st.plotly_chart(
+                                px.line(filtered_market, x='report_date', y='drawdown_units', color='policy_name', title='Windowed Real-Market Policy Drawdown (Units)'),
+                                use_container_width=True,
+                            )
+                        else:
+                            st.dataframe(filtered_market[['report_date', 'policy_name', 'drawdown_units']], use_container_width=True, hide_index=True)
+            else:
+                st.info('Real-market rolling policy ranking will populate once enough settled priced bets exist for alternate-policy replay.')
+
+            if not realized_daily.empty:
+                realized_window = _filter_to_window(realized_daily, 'report_date', selected_window_days)
+                if not realized_window.empty:
+                    overlay_cols = st.columns(4)
+                    overlay_cols[0].metric('Real-market settled bets', int(realized_window['bets'].sum()) if 'bets' in realized_window.columns else 0)
+                    overlay_cols[1].metric('Real-market ROI', _fmt_pct((realized_window['result_units'].sum() / realized_window['stake_units'].sum()) if abs(float(realized_window['stake_units'].sum())) > 1e-9 else None))
+                    overlay_cols[2].metric('Real-market drawdown', _fmt_num(abs(float((realized_window['cumulative_units'] - realized_window['cumulative_units'].cummax()).min() or 0.0)), 2) + 'u')
+                    overlay_cols[3].metric('Average CLV', _fmt_num(realized_window['avg_clv'].dropna().mean() if 'avg_clv' in realized_window.columns and not realized_window['avg_clv'].dropna().empty else None, 3))
+                    if px is not None:
+                        st.plotly_chart(
+                            px.line(realized_window, x='report_date', y='cumulative_units', title='Real-Market Bankroll Path (Current Deployed Policy)'),
+                            use_container_width=True,
+                        )
+                    st.caption('Plain English: this is the live execution health check for the currently deployed policy, while the alternate-policy replay above compares what the other bankroll styles would have done on the same priced bets.')
+            st.markdown('**Recommendation drift**')
+            st.caption('Technical: this is the canonical policy research history stored at export time using Base posture, phase-default unit risk, and 1.0 deployment. Plain English: it lets you see when the model started preferring a different bankroll style instead of trusting only the current screen.')
+            if not policy_research_history.empty:
+                drift_history = policy_research_history.copy()
+                drift_history['as_of_report_date'] = pd.to_datetime(drift_history.get('as_of_report_date'), errors='coerce')
+                drift_history = drift_history.dropna(subset=['as_of_report_date'])
+                drift_window = drift_history[drift_history['window_label'].astype(str) == selected_window_label].copy()
+                if drift_window.empty:
+                    drift_window = drift_history.copy()
+                drift_window = drift_window.sort_values('as_of_report_date').reset_index(drop=True)
+                policy_changes = 0
+                if not drift_window.empty:
+                    policy_changes = int((drift_window['recommended_policy'].astype(str) != drift_window['recommended_policy'].astype(str).shift(1)).sum() - 1)
+                    policy_changes = max(policy_changes, 0)
+                drift_cols = st.columns(4)
+                latest_drift = drift_window.tail(1)
+                drift_cols[0].metric('Latest canonical policy', str(latest_drift['recommended_policy'].iloc[0]) if not latest_drift.empty else 'N/A')
+                drift_cols[1].metric('Latest canonical posture', str(latest_drift['recommended_posture'].iloc[0]) if not latest_drift.empty else 'N/A')
+                drift_cols[2].metric('Recommendation changes', policy_changes)
+                drift_cols[3].metric('Tracked exports', int(len(drift_window)))
+                if px is not None and not drift_window.empty:
+                    drift_plot = drift_window.copy()
+                    drift_plot['policy_posture'] = drift_plot['recommended_policy'].astype(str) + ' | ' + drift_plot['recommended_posture'].astype(str)
+                    st.plotly_chart(
+                        px.scatter(
+                            drift_plot,
+                            x='as_of_report_date',
+                            y='recommended_policy',
+                            color='evidence_strength',
+                            symbol='recommended_posture',
+                            hover_data=['window_label', 'evidence_source', 'plain_english'],
+                            title='Canonical Policy Recommendation Drift',
+                        ),
+                        use_container_width=True,
+                    )
+                drift_cols_to_show = [
+                    col for col in [
+                        'as_of_report_date', 'window_label', 'recommended_policy', 'recommended_posture',
+                        'evidence_source', 'evidence_strength', 'plain_english'
+                    ] if col in drift_window.columns
+                ]
+                st.dataframe(drift_window[drift_cols_to_show].sort_values('as_of_report_date', ascending=False), use_container_width=True, hide_index=True)
+            else:
+                st.info('Canonical recommendation history will appear here after the next successful export run writes the research tables.')
+            st.markdown('**Real-market proof**')
+            st.caption('Technical: this uses settled journal rows with real stake units and results. Plain English: once priced bets are logged, this becomes the true profitability scorecard instead of the shadow simulator.')
+            realized_summary, realized_by_market = _build_market_realized_summary(bet_journal)
+            if not realized_summary.empty:
+                realized_row = realized_summary.iloc[0]
+                realized_cols = st.columns(4)
+                realized_cols[0].metric('Settled market bets', int(realized_row.get('settled_bets') or 0))
+                realized_cols[1].metric('Realized P&L', _fmt_num(realized_row.get('result_units'), 2) + 'u')
+                realized_cols[2].metric('Realized ROI', _fmt_pct(realized_row.get('roi_pct')))
+                realized_cols[3].metric('Avg CLV', _fmt_num(realized_row.get('avg_clv'), 3))
+                if not realized_by_market.empty:
+                    st.dataframe(realized_by_market, use_container_width=True, hide_index=True)
+            else:
+                st.info('No settled priced bets are available yet, so this section will turn on once regular-season market journaling starts filling in.')
+            if not bet_journal.empty and 'result_units' in bet_journal.columns:
+
+                settled = bet_journal.copy()
+                settled['result_units'] = pd.to_numeric(settled['result_units'], errors='coerce')
+                settled['report_date'] = pd.to_datetime(settled.get('report_date'), errors='coerce')
+                settled = settled.dropna(subset=['result_units', 'report_date']).sort_values('report_date')
+                if not settled.empty:
+                    settled['cumulative_units'] = settled['result_units'].cumsum()
+                    _render_line_chart(settled, 'report_date', 'cumulative_units', 'Settled Bet Equity Curve')
+
+    with tabs[3]:
+        st.subheader('Validation View')
+        if clean_backtest.empty:
+            st.info('Clean replay data is not available yet.')
+        else:
+            validation_daily = _daily_validation(clean_backtest)
+            if not validation_daily.empty:
+                left, right = st.columns(2)
+                with left:
+                    _render_line_chart(validation_daily, 'date', 'log_loss', 'Daily OOS Log Loss')
+                with right:
+                    _render_line_chart(validation_daily, 'date', 'accuracy', 'Daily OOS Accuracy')
+                left, right = st.columns(2)
+                with left:
+                    _render_line_chart(validation_daily, 'date', 'total_mae', 'Daily Totals MAE')
+                with right:
+                    _render_line_chart(validation_daily, 'date', 'margin_mae', 'Daily Margin MAE')
+            calibration = _calibration_table(clean_backtest)
+            if not calibration.empty:
+                _render_bar_chart(calibration, 'bucket', 'actual_win_rate', 'Calibration by Probability Bucket')
+                st.dataframe(calibration, use_container_width=True, hide_index=True)
+            clean_work = clean_backtest.copy()
+            if {'projected_total', 'home_score', 'away_score'}.issubset(clean_work.columns):
+                clean_work['actual_total'] = pd.to_numeric(clean_work['home_score'], errors='coerce') + pd.to_numeric(clean_work['away_score'], errors='coerce')
+                total_points = clean_work.dropna(subset=['projected_total', 'actual_total']).copy()
+                if not total_points.empty and px is not None:
+                    st.plotly_chart(px.scatter(total_points, x='projected_total', y='actual_total', title='Projected vs Actual Totals'), use_container_width=True)
+            if {'projected_margin', 'home_score', 'away_score'}.issubset(clean_work.columns):
+                clean_work['actual_margin'] = pd.to_numeric(clean_work['home_score'], errors='coerce') - pd.to_numeric(clean_work['away_score'], errors='coerce')
+                margin_points = clean_work.dropna(subset=['projected_margin', 'actual_margin']).copy()
+                if not margin_points.empty and px is not None:
+                    st.plotly_chart(px.scatter(margin_points, x='projected_margin', y='actual_margin', title='Projected vs Actual Margin'), use_container_width=True)
+
+    with tabs[4]:
+        st.subheader('Research View')
+        left, right = st.columns(2)
+        with left:
+            st.markdown('**Model State Blocks**')
+            summary_blocks = []
+            for key in ['probability_shrinkage', 'total_shrinkage', 'margin_shrinkage', 'lineup_earn_back']:
+                if key in model_state:
+                    summary_blocks.append({'block': key, 'payload': json.dumps(model_state.get(key), indent=2)[:500]})
+            if summary_blocks:
+                st.dataframe(pd.DataFrame(summary_blocks), use_container_width=True, hide_index=True)
+            else:
+                st.info('No model-state blocks were available.')
+        with right:
+            st.markdown('**Live Archive Progress**')
+            if not live_archive.empty and 'report_date' in live_archive.columns:
+                archive_view = live_archive.copy()
+                archive_view['report_date'] = pd.to_datetime(archive_view['report_date'], errors='coerce')
+                archive_daily = archive_view.groupby('report_date', dropna=True).size().reset_index(name='games_archived')
+                _render_line_chart(archive_daily, 'report_date', 'games_archived', 'Archived Live Predictions by Date')
+            else:
+                st.info('The live prediction archive is still empty.')
+        with st.expander('Raw model_state.json', expanded=False):
+            st.code(json.dumps(model_state, indent=2), language='json')
+
+
+if __name__ == '__main__':
+    main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

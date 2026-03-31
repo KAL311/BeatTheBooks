@@ -1,0 +1,10 @@
+import run_daily_mlb_report as m
+state = m.load_model_state()
+print('tc_apply', ((state.get('total_calibration') or {}).get('spring') or {}).get('apply'))
+print('tc_intercept', ((state.get('total_calibration') or {}).get('spring') or {}).get('intercept'))
+print('ts_apply', ((state.get('total_shrinkage') or {}).get('spring') or {}).get('apply'))
+print('ts_alpha', ((state.get('total_shrinkage') or {}).get('spring') or {}).get('alpha'))
+print('simple_total', m.simple_total_baseline_from_phase('spring', state))
+print('alpha', m.total_shrinkage_alpha(state, 'spring', m.today_local()))
+print('apply_total', m.apply_total_calibration(9.333570276350274, state, 'spring'))
+print('blend_total', m.blend_total_with_baseline(10.304888372315922, 'spring', state, m.today_local()))

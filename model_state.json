@@ -1,0 +1,429 @@
+{
+  "version": 2,
+  "weights": {
+    "w_off": 0.27217949307259875,
+    "w_starter": 0.5448754248348529,
+    "w_bullpen": 0.10439843839701751,
+    "w_park": 0.030451118008983393,
+    "w_weather": 0.020035806793107222,
+    "w_context": 0.1552041639081425,
+    "home_field": 0.06833338352208673,
+    "spread_scale": 8.0
+  },
+  "weights_by_phase": {
+    "spring": {
+      "w_off": 0.27217949307259875,
+      "w_starter": 0.5448754248348529,
+      "w_bullpen": 0.10439843839701751,
+      "w_park": 0.030451118008983393,
+      "w_weather": 0.020035806793107222,
+      "w_context": 0.1552041639081425,
+      "home_field": 0.06833338352208673,
+      "spread_scale": 8.0
+    },
+    "regular": {
+      "w_off": 0.27217949307259875,
+      "w_starter": 0.5448754248348529,
+      "w_bullpen": 0.10439843839701751,
+      "w_park": 0.030451118008983393,
+      "w_weather": 0.020035806793107222,
+      "w_context": 0.1552041639081425,
+      "home_field": 0.06833338352208673,
+      "spread_scale": 8.0
+    }
+  },
+  "regular_transition": {
+    "bridge_days": 14,
+    "spring_carryover_max": 0.35
+  },
+  "last_update_date": "2026-03-15",
+  "backtest_refresh": {
+    "version": 5,
+    "completed_dates": [
+      "2026-02-21",
+      "2026-02-22",
+      "2026-02-23",
+      "2026-02-24",
+      "2026-02-25",
+      "2026-03-09",
+      "2026-03-10",
+      "2026-03-11",
+      "2026-03-12",
+      "2026-03-13",
+      "2026-03-14"
+    ]
+  },
+  "totals_refresh": {
+    "version": 2,
+    "completed_dates": [
+      "2026-03-11",
+      "2026-03-12",
+      "2026-03-13",
+      "2026-03-14"
+    ]
+  },
+  "probability_calibration": {
+    "spring": {
+      "apply": true,
+      "mode": "platt_scaling",
+      "intercept": -0.0482754616401317,
+      "slope": 0.9865898930793292,
+      "games": 164,
+      "raw_log_loss": 0.6842208713430474,
+      "calibrated_log_loss": 0.6821421432807113,
+      "reason": "spring probability calibration improved log loss by 0.0021 over 164 historical games"
+    },
+    "regular": {
+      "apply": false,
+      "mode": "identity",
+      "intercept": 0.0,
+      "slope": 1.0,
+      "games": 0,
+      "raw_log_loss": null,
+      "calibrated_log_loss": null,
+      "reason": "no regular backtest rows available for probability calibration"
+    }
+  },
+  "total_calibration": {
+    "spring": {
+      "apply": true,
+      "mode": "affine_total_calibration",
+      "intercept": 0.9755167056535455,
+      "slope": 0.9995502724558547,
+      "tail_slope": 0,
+      "tail_threshold": 9,
+      "games": 164,
+      "raw_rmse": 5.213806481294726,
+      "calibrated_rmse": 5.0593520862751395,
+      "reason": "spring total calibration improved RMSE by 0.154 over 164 historical games"
+    },
+    "regular": {
+      "apply": false,
+      "mode": "identity",
+      "intercept": 0.0,
+      "slope": 1.0,
+      "tail_slope": 0.0,
+      "tail_threshold": 9.0,
+      "games": 0,
+      "raw_rmse": null,
+      "calibrated_rmse": null,
+      "reason": "insufficient regular sample for total calibration fitting (0 rows)"
+    }
+  },
+  "margin_calibration": {
+    "spring": {
+      "apply": false,
+      "mode": "identity",
+      "intercept": -0.039184634265829105,
+      "slope": 1.5,
+      "games": 164,
+      "raw_rmse": 4.825539295664877,
+      "calibrated_rmse": 4.790251044477318,
+      "reason": "spring margin calibration did not improve RMSE enough to activate (4.826 to 4.790)"
+    },
+    "regular": {
+      "apply": false,
+      "mode": "identity",
+      "intercept": 0.0,
+      "slope": 1.0,
+      "games": 0,
+      "raw_rmse": null,
+      "calibrated_rmse": null,
+      "reason": "no regular backtest rows available for margin calibration"
+    }
+  },
+  "spring_guardrail": {
+    "apply": false,
+    "mode": "learned",
+    "blend": 0.0,
+    "reason": "learned spring profile matches or beats the simple power baseline out of sample",
+    "full_oos_log_loss": 0.701395620194079,
+    "simple_oos_log_loss": 0.7032379154850728,
+    "oos_gap": -0.0018422952909937784,
+    "out_of_sample_games": 59,
+    "adjusted_weights": {
+      "w_off": 0.27217949307259875,
+      "w_starter": 0.5448754248348529,
+      "w_bullpen": 0.10439843839701751,
+      "w_park": 0.030451118008983393,
+      "w_weather": 0.020035806793107222,
+      "w_context": 0.1552041639081425,
+      "home_field": 0.06833338352208673,
+      "spread_scale": 8.0
+    },
+    "simple_power_weights": {
+      "w_off": 0.35512988583912375,
+      "w_starter": 0.0,
+      "w_bullpen": 0.0,
+      "w_park": 0.0,
+      "w_weather": 0.0,
+      "w_context": 0.0,
+      "home_field": 0.052595193259434174,
+      "spread_scale": 8.0
+    }
+  },
+  "regular_earn_back": {
+    "apply": false,
+    "mode": "awaiting_regular_sample",
+    "enabled_features": [],
+    "reason": "regular-season backtest sample not available yet",
+    "base_oos_log_loss": null,
+    "selected_oos_log_loss": null,
+    "feature_results": {},
+    "adjusted_weights": {
+      "w_off": 0.27217949307259875,
+      "w_starter": 0.0,
+      "w_bullpen": 0.0,
+      "w_park": 0.0,
+      "w_weather": 0.0,
+      "w_context": 0.0,
+      "home_field": 0.06833338352208673,
+      "spread_scale": 8.0
+    }
+  },
+  "lineup_earn_back": {
+    "apply": false,
+    "mode": "awaiting_regular_confirmed_lineups",
+    "confirmed_games": 38,
+    "required_games": 40,
+    "lineup_multiplier": 0.0,
+    "no_lineup_log_loss": null,
+    "full_lineup_log_loss": null,
+    "improvement": null,
+    "date_span": "2026-03-26 to 2026-03-30",
+    "reason": "need 40 settled regular-season confirmed-lineup games; currently 38"
+  },
+  "probability_shrinkage": {
+    "spring": {
+      "apply": false,
+      "alpha": 0.0,
+      "games": 59,
+      "model_log_loss": 0.719008704543694,
+      "simple_log_loss": 0.7207924233402146,
+      "blended_log_loss": 0.719008704543694,
+      "reason": "spring shrinkage did not improve log loss enough over 59 OOS games"
+    },
+    "regular": {
+      "apply": false,
+      "alpha": 0.0,
+      "games": 0,
+      "model_log_loss": null,
+      "simple_log_loss": null,
+      "blended_log_loss": null,
+      "reason": "insufficient regular OOS sample for shrinkage fitting (0 games)"
+    },
+    "regular_bridge": {
+      "apply": false,
+      "max_alpha": 0.0,
+      "bridge_days": 21,
+      "reason": "no spring shrinkage signal available for early-regular bridge"
+    }
+  },
+  "total_shrinkage": {
+    "spring": {
+      "apply": true,
+      "alpha": 0.6,
+      "games": 59,
+      "model_rmse": 5.089374276708751,
+      "simple_rmse": 4.989851253961405,
+      "blended_rmse": 5.005509816036952,
+      "reason": "spring total shrinkage improved RMSE by 0.084 over 59 OOS games"
+    },
+    "regular": {
+      "apply": false,
+      "alpha": 0.0,
+      "games": 0,
+      "model_rmse": null,
+      "simple_rmse": null,
+      "blended_rmse": null,
+      "reason": "insufficient regular OOS sample for total shrinkage fitting (0 games)"
+    },
+    "regular_bridge": {
+      "apply": true,
+      "max_alpha": 0.2,
+      "bridge_days": 21,
+      "reason": "early regular season bridge derived from spring total shrinkage alpha 0.60"
+    }
+  },
+  "margin_shrinkage": {
+    "spring": {
+      "apply": false,
+      "alpha": 0.0,
+      "games": 59,
+      "model_rmse": 5.225274545570122,
+      "simple_rmse": 5.322348564758168,
+      "blended_rmse": 5.225274545570122,
+      "reason": "spring margin shrinkage did not improve RMSE enough over 59 OOS games"
+    },
+    "regular": {
+      "apply": false,
+      "alpha": 0.0,
+      "games": 0,
+      "model_rmse": null,
+      "simple_rmse": null,
+      "blended_rmse": null,
+      "reason": "insufficient regular OOS sample for margin shrinkage fitting (0 games)"
+    },
+    "regular_bridge": {
+      "apply": false,
+      "max_alpha": 0.0,
+      "bridge_days": 21,
+      "reason": "no spring margin shrinkage signal available for early-regular bridge"
+    }
+  },
+  "realized_uncertainty": {
+    "updated_ts": "2026-03-31T17:09:32.655937+00:00",
+    "source": "settled live archive + settled market journal",
+    "spring": {
+      "moneyline": {
+        "apply": true,
+        "market_type": "moneyline",
+        "settled_games": 139,
+        "priced_bets": 0,
+        "priced_days": 0,
+        "model_error": 0.24392207585711762,
+        "simple_error": 0.24986625935155707,
+        "tail_model_error": 0.16232525235310888,
+        "tail_simple_error": 0.19611167048223035,
+        "avg_clv": null,
+        "roi": null,
+        "confidence": 1.0,
+        "bias_add": -0.027790878804366405,
+        "penalty_scale": 1.0222327030434932,
+        "reason": "model is outperforming the simple baseline; 139 settled games, 0 priced bets"
+      },
+      "total": {
+        "apply": true,
+        "market_type": "total",
+        "settled_games": 139,
+        "priced_bets": 0,
+        "priced_days": 0,
+        "model_error": 4.478014952059542,
+        "simple_error": 4.623667649518433,
+        "tail_model_error": 4.520209529990557,
+        "tail_simple_error": 4.65956782278727,
+        "avg_clv": null,
+        "roi": null,
+        "confidence": 1.0,
+        "bias_add": -0.01195837344792195,
+        "penalty_scale": 1.0095666987583376,
+        "reason": "model is outperforming the simple baseline; 139 settled games, 0 priced bets"
+      },
+      "run_line": {
+        "apply": true,
+        "market_type": "run_line",
+        "settled_games": 139,
+        "priced_bets": 0,
+        "priced_days": 0,
+        "model_error": 3.674183622996077,
+        "simple_error": 3.7693983999992517,
+        "tail_model_error": 4.0905978730608625,
+        "tail_simple_error": 4.426947686159674,
+        "avg_clv": null,
+        "roi": null,
+        "confidence": 1.0,
+        "bias_add": -0.014955601341334139,
+        "penalty_scale": 1.0119644810730672,
+        "reason": "model is outperforming the simple baseline; 139 settled games, 0 priced bets"
+      }
+    },
+    "regular": {
+      "moneyline": {
+        "apply": true,
+        "market_type": "moneyline",
+        "settled_games": 62,
+        "priced_bets": 55,
+        "priced_days": 6,
+        "model_error": 0.24162624205464184,
+        "simple_error": 0.2428561727578499,
+        "tail_model_error": 0.2567736123855713,
+        "tail_simple_error": 0.23315217660312654,
+        "avg_clv": 0.03633022181256276,
+        "roi": 0.15114933173125772,
+        "confidence": 1.0,
+        "bias_add": -0.011343221608427913,
+        "penalty_scale": 1.0090745772867424,
+        "reason": "model and simple baseline are still fairly close; 62 settled games, 55 priced bets; avg CLV +0.036, ROI +15.1%"
+      },
+      "total": {
+        "apply": true,
+        "market_type": "total",
+        "settled_games": 62,
+        "priced_bets": 31,
+        "priced_days": 6,
+        "model_error": 3.895333424504009,
+        "simple_error": 3.8999999999999995,
+        "tail_model_error": 4.106196457225265,
+        "tail_simple_error": 3.997560975609756,
+        "avg_clv": -0.3225806451612903,
+        "roi": -0.19972318008449433,
+        "confidence": 1.0,
+        "bias_add": 0.018124848593018585,
+        "penalty_scale": 0.9456254542209442,
+        "reason": "model and simple baseline are still fairly close; 62 settled games, 31 priced bets; avg CLV -0.323, ROI -20.0%"
+      },
+      "run_line": {
+        "apply": true,
+        "market_type": "run_line",
+        "settled_games": 62,
+        "priced_bets": 50,
+        "priced_days": 6,
+        "model_error": 3.1945585482764485,
+        "simple_error": 3.1406873267396094,
+        "tail_model_error": 3.3320229470009988,
+        "tail_simple_error": 3.3131151235383456,
+        "avg_clv": -0.4722309368105569,
+        "roi": 0.2668542450045149,
+        "confidence": 1.0,
+        "bias_add": 0.004097531425974121,
+        "penalty_scale": 0.9877074057220776,
+        "reason": "model and simple baseline are still fairly close; 62 settled games, 50 priced bets; avg CLV -0.472, ROI +26.7%"
+      }
+    }
+  },
+  "total_sigma_calibration": {
+    "spring": {
+      "apply": true,
+      "scale": 0.8508879934323543,
+      "games": 59,
+      "raw_nll": 3.0354217340952183,
+      "calibrated_nll": 3.011941768752129,
+      "z_mean": -0.024896313532020844,
+      "z_std": 0.8505236921684507,
+      "reason": "spring total sigma calibration improved Gaussian NLL by 0.0235 over 59 OOS games"
+    },
+    "regular": {
+      "apply": false,
+      "scale": 1.0,
+      "games": 0,
+      "raw_nll": null,
+      "calibrated_nll": null,
+      "z_mean": null,
+      "z_std": null,
+      "reason": "insufficient regular sample for total sigma calibration (0 rows)"
+    }
+  },
+  "live_archive_context_refresh": {
+    "version": 1,
+    "completed_dates": [
+      "2026-03-15",
+      "2026-03-16",
+      "2026-03-17",
+      "2026-03-18",
+      "2026-03-19",
+      "2026-03-20",
+      "2026-03-21",
+      "2026-03-22",
+      "2026-03-23",
+      "2026-03-24",
+      "2026-03-25",
+      "2026-03-26",
+      "2026-03-27",
+      "2026-03-28",
+      "2026-03-29",
+      "2026-03-30"
+    ],
+    "last_run_ts": "2026-03-31T17:09:31.793050+00:00",
+    "last_rows_refreshed": 15
+  }
+}
