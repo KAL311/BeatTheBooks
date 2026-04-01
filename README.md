@@ -18,6 +18,30 @@ Install the dashboard/runtime dependencies if needed:
 python -m pip install -r .\quant_dashboard_requirements.txt
 ```
 
+## Dashboard
+
+The quant dashboard is a local Streamlit app that acts as the project control center. It is not deployed from GitHub by default, so repository visitors can review the code and documentation but must run it locally to use the interface.
+
+Launch it with:
+
+```powershell
+streamlit run .\quant_dashboard.py
+```
+
+What the dashboard covers:
+
+- Operator briefing and current health
+- Today’s slate and model-driven bet rationale
+- Portfolio sizing and policy research
+- Research replay vs live settled validation
+- Market proof, CLV, and activation readiness
+- Ask-the-model Q&A and parlay builder tools
+
+Important note:
+
+- GitHub is the backup/source copy of the project.
+- The live dashboard experience still depends on local data files such as the DuckDB and SQLite stores that are intentionally not pushed to GitHub.
+
 ## GitHub Backup Notes
 
 This project is designed to keep live processing local while still allowing a clean GitHub backup of the recoverable source.
