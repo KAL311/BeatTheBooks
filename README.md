@@ -35,6 +35,28 @@ Local-only runtime artifacts that are not intended for normal GitHub backup:
 - `MLB_Season_To_Date_2026.xlsx`
 - virtual environment and cache folders
 
+## GitHub Backup Commands
+
+Quick manual backup flow:
+
+```powershell
+git add -A
+git commit -m "Describe the update"
+git push
+```
+
+One-command helper:
+
+```powershell
+pwsh -File .\backup_to_github.ps1 -Message "Describe the update"
+```
+
+Useful variant for a local-only commit:
+
+```powershell
+pwsh -File .\backup_to_github.ps1 -Message "Describe the update" -SkipPush
+```
+
 ## Daily Workflow
 
 Run the full market capture -> report -> post-capture cycle:
