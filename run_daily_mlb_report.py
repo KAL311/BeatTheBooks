@@ -4878,6 +4878,15 @@ def main():
     if market_map:
         warnings.append(f"Current sportsbook consensus loaded for {len(market_map)} game(s).")
 
+    umpire_cache = load_umpire_stats_cache()
+    umpire_refreshed_date = str(umpire_cache.get('_refreshed_date', ''))
+    if umpire_refreshed_date != report_date.isoformat():
+        umpire_cache = refresh_umpire_cache_from_savant(client, umpire_cache)
+        umpire_cache['_refreshed_date'] = report_date.isoformat()
+        save_umpire_stats_cache(umpire_cache)
+    umpire_known = sum(1 for k in umpire_cache if not k.startswith('_'))
+    warnings.append(f"Umpire cache: {umpire_known} umpire(s) loaded{'' if umpire_known else ' — cache empty, adjustments will be 0'}.")
+
     season_start, pregame_end, game_types = dt.date(report_date.year, 1, 1), report_date, ('S|' if phase == 'spring' else 'R|')
     current_batter_raw = savant_statcast_csv(client, 'batter', report_date.year, season_start, pregame_end, game_types)
     batter_raw_30 = savant_statcast_csv(client, 'batter', report_date.year, report_date - dt.timedelta(days=30), pregame_end, game_types)
@@ -4917,6 +4926,7 @@ def main():
             client,
             venue_cache,
             margin_sigma,
+            umpire_cache=umpire_cache,
         )
         for game in games
     ]
