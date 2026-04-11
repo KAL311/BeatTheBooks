@@ -22,6 +22,17 @@ def parse_args():
     parser.add_argument('--output', type=str, default=DEFAULT_OUTPUT_PATH, help='CSV output path for clean replay rows.')
     parser.add_argument('--summary-output', type=str, default=DEFAULT_SUMMARY_PATH, help='JSON summary output path.')
     parser.add_argument('--rebuild', action='store_true', help='Ignore any existing clean replay log and rebuild from scratch.')
+    parser.add_argument(
+        '--source',
+        type=str,
+        default='legacy',
+        choices=['legacy', 'archive', 'both'],
+        help=(
+            'Date source: "legacy" uses backtest_log.csv (default, spring/preseason), '
+            '"archive" uses settled regular-season rows from live_prediction_archive.csv, '
+            '"both" merges both sources.'
+        ),
+    )
     return parser.parse_args()
 
 
@@ -38,6 +49,42 @@ def replay_dates_from_legacy_log(start_date=None, end_date=None, max_dates=None)
         dates = [value for value in dates if value >= start_date]
     if end_date is not None:
         dates = [value for value in dates if value <= end_date]
+    if max_dates is not None:
+        dates = dates[-int(max_dates):]
+    return dates
+
+
+def replay_dates_from_archive(start_date=None, end_date=None, max_dates=None):
+    """Return sorted unique dates from settled regular-season rows in the live prediction archive."""
+    archive = m.load_live_prediction_archive()
+    if archive.empty:
+        return []
+    work = archive.copy()
+    # Only settled rows (y_home present) in the regular phase
+    work = work[work.get('phase', pd.Series(dtype=str)) == 'regular'] if 'phase' in work.columns else work
+    if 'y_home' in work.columns:
+        work = work[pd.to_numeric(work['y_home'], errors='coerce').notna()]
+    if 'report_date' not in work.columns:
+        return []
+    dates = sorted(pd.to_datetime(work['report_date'], errors='coerce').dropna().dt.date.unique())
+    if start_date is not None:
+        dates = [value for value in dates if value >= start_date]
+    if end_date is not None:
+        dates = [value for value in dates if value <= end_date]
+    if max_dates is not None:
+        dates = dates[-int(max_dates):]
+    return dates
+
+
+def collect_replay_dates(source, start_date=None, end_date=None, max_dates=None):
+    if source == 'archive':
+        dates = replay_dates_from_archive(start_date=start_date, end_date=end_date)
+    elif source == 'both':
+        legacy = replay_dates_from_legacy_log(start_date=start_date, end_date=end_date)
+        archive = replay_dates_from_archive(start_date=start_date, end_date=end_date)
+        dates = sorted(set(legacy) | set(archive))
+    else:
+        dates = replay_dates_from_legacy_log(start_date=start_date, end_date=end_date)
     if max_dates is not None:
         dates = dates[-int(max_dates):]
     return dates
@@ -297,7 +344,8 @@ def main():
     args = parse_args()
     start_date = parse_date(args.start_date)
     end_date = parse_date(args.end_date)
-    dates = replay_dates_from_legacy_log(start_date=start_date, end_date=end_date, max_dates=args.max_dates)
+    dates = collect_replay_dates(args.source, start_date=start_date, end_date=end_date, max_dates=args.max_dates)
+    print(f'SOURCE {args.source} | dates={len(dates)}')
     final_df, summary = replay_clean_backtest(dates, args.output, args.summary_output, rebuild=args.rebuild)
     print('STATUS clean walk-forward replay built')
     print('OUTPUT', args.output)

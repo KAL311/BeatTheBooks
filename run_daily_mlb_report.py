@@ -26,12 +26,14 @@ SPORTSBOOK_DB_PATH = os.path.join(OUT_DIR, "sportsbook_lines.db")
 QUANT_DB_PATH = os.path.join(OUT_DIR, "mlb_quant_dashboard.duckdb")
 PARK_FACTORS_CACHE_PATH = os.path.join(OUT_DIR, "park_factors_cache.csv")
 VENUE_METADATA_CACHE_PATH = os.path.join(OUT_DIR, "venue_metadata_cache.json")
+UMPIRE_STATS_CACHE_PATH = os.path.join(OUT_DIR, "umpire_stats_cache.json")
 STATSAPI_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
 STATSAPI_GAME_FEED_URL = "https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live"
 STATSAPI_VENUE_URL = "https://statsapi.mlb.com/api/v1/venues/{venue_id}"
 STATSAPI_TEAM_ROSTER_URL = "https://statsapi.mlb.com/api/v1/teams/{team_id}/roster"
 OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 SAVANT_STATCAST_CSV_URL = "https://baseballsavant.mlb.com/statcast_search/csv"
+STATSAPI_GAME_OFFICIALS_URL = "https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore"
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; MLB-Report-Clean-Rebuild/1.0)"}
 LOCAL_TZ = ZoneInfo("America/Chicago")
 UTC_TZ = ZoneInfo("UTC")
@@ -295,6 +297,20 @@ def load_venue_metadata_cache():
 def save_venue_metadata_cache(cache):
     with open(VENUE_METADATA_CACHE_PATH, 'w', encoding='utf-8') as handle:
         json.dump(cache, handle, indent=2)
+
+def load_umpire_stats_cache():
+    if not os.path.exists(UMPIRE_STATS_CACHE_PATH):
+        return {}
+    try:
+        with open(UMPIRE_STATS_CACHE_PATH, 'r', encoding='utf-8') as handle:
+            return json.load(handle)
+    except Exception:
+        return {}
+
+def save_umpire_stats_cache(cache):
+    with open(UMPIRE_STATS_CACHE_PATH, 'w', encoding='utf-8') as handle:
+        json.dump(cache, handle, indent=2)
+
 def phase_weights_from_state(state, phase):
     weights = {
         'w_off': 0.60, 'w_starter': 0.45, 'w_bullpen': 0.20,
@@ -1169,6 +1185,77 @@ def resolve_batter_projection(batter_name, batter_id, current_df, prior_df):
     return _resolve_batter_projection_from_maps(batter_name, batter_id, current_by_name, current_by_id, prior_by_name, prior_by_id)
 
 
+STATSAPI_TRANSACTIONS_URL = "https://statsapi.mlb.com/api/v1/transactions"
+
+# IL/DL status codes from the MLB Stats API transaction wire
+_IL_TRANSACTION_TYPES = frozenset([
+    'placed_on_il', 'transferred_to_il', 'placed_on_restricted_list',
+    'placed_on_bereavement_list', 'placed_on_paternity_list',
+    'placed_on_emergency_disabled_list', 'suspended',
+])
+_ACTIVATED_TRANSACTION_TYPES = frozenset([
+    'activated_from_il', 'recalled_from_minors', 'selected_from_minors',
+    'reinstated_from_il', 'reinstated_from_restricted_list',
+])
+
+
+def fetch_team_injury_transactions(client, team_id, target_date, lookback_days=7):
+    """Fetch recent IL transactions for a team from the MLB Stats API transaction wire.
+
+    Returns a dict with:
+      - newly_placed: list of player names newly placed on IL in the last `lookback_days`
+      - newly_activated: list of player names recently activated from IL
+      - net_il_impact: float score — negative means more absences (hurts offense)
+    """
+    result = {'newly_placed': [], 'newly_activated': [], 'net_il_impact': 0.0, 'source': 'unavailable'}
+    if team_id is None:
+        return result
+    start_date = (target_date - dt.timedelta(days=lookback_days)).isoformat()
+    end_date = target_date.isoformat()
+    cache_key = f"tx:{int(team_id)}:{start_date}:{end_date}"
+    if hasattr(client, '_transaction_cache') and cache_key in client._transaction_cache:
+        return dict(client._transaction_cache[cache_key])
+    if not hasattr(client, '_transaction_cache'):
+        client._transaction_cache = {}
+    try:
+        payload = client.get_json(
+            STATSAPI_TRANSACTIONS_URL,
+            params={'teamId': int(team_id), 'startDate': start_date, 'endDate': end_date},
+            timeout=20,
+        )
+        transactions = payload.get('transactions') or []
+    except Exception:
+        return result
+
+    newly_placed = []
+    newly_activated = []
+    for tx in transactions:
+        tx_type = str(tx.get('typeCode') or tx.get('type') or '').lower().replace(' ', '_')
+        person = tx.get('person') or {}
+        name = canonical_player_name(person.get('fullName') or person.get('name'))
+        if not name:
+            continue
+        if tx_type in _IL_TRANSACTION_TYPES:
+            newly_placed.append(name)
+        elif tx_type in _ACTIVATED_TRANSACTION_TYPES:
+            newly_activated.append(name)
+
+    # Net impact: each newly-placed hitter represents a lineup quality dip
+    # Each newly-activated player represents a boost (returning star)
+    net_il_impact = float(np.clip(
+        (len(newly_activated) * 0.04) - (len(newly_placed) * 0.06),
+        -0.30, 0.20,
+    ))
+    result = {
+        'newly_placed': newly_placed,
+        'newly_activated': newly_activated,
+        'net_il_impact': net_il_impact,
+        'source': 'statsapi_transactions',
+    }
+    client._transaction_cache[cache_key] = dict(result)
+    return result
+
+
 def fetch_team_roster_snapshot(client, team_id, target_date):
     if team_id is None or safe_float(team_id) is None:
         return []
@@ -1927,7 +2014,7 @@ def team_travel_rest_context(client, team_abbrev, game, venue_cache, lookback_da
     target_date = game['scheduled_utc'].astimezone(LOCAL_TZ).date()
     previous_game = most_recent_team_game(client, team_abbrev, target_date, lookback_days=lookback_days)
     if previous_game is None:
-        return {'off_days': 1, 'travel_miles': 0.0, 'score': 0.02, 'previous_game_found': False}
+        return {'off_days': 1, 'travel_miles': 0.0, 'score': 0.02, 'previous_game_found': False, 'direction_penalty': 0.0}
     current_meta = fetch_venue_metadata(client, game.get('venue_id'), game.get('venue_name'), venue_cache)
     previous_meta = fetch_venue_metadata(client, previous_game.get('venue_id'), previous_game.get('venue_name'), venue_cache)
     off_days = max(0, (target_date - previous_game['game_date']).days - 1)
@@ -1951,10 +2038,35 @@ def team_travel_rest_context(client, team_abbrev, game, venue_cache, lookback_da
         score -= 0.03
     if previous_game.get('was_home') and game.get('home_team') == team_abbrev and travel_miles < 30:
         score += 0.015
+
+    # East-west direction penalty: traveling eastward crosses time zones in the harder
+    # direction (losing hours, earlier wake-up), amplifying fatigue on same-day or next-day travel.
+    # Uses longitude delta: negative delta = traveling east (moving to smaller/more-negative longitude
+    # in the US coordinate system, i.e., higher absolute longitude value).
+    direction_penalty = 0.0
+    prev_lon = safe_float(previous_meta.get('longitude'))
+    curr_lon = safe_float(current_meta.get('longitude'))
+    if prev_lon is not None and curr_lon is not None and travel_miles > 300:
+        # In US, longitudes are negative; moving east means curr_lon > prev_lon (less negative)
+        # e.g., LAX (−118) → NYC (−74): delta = −74 − (−118) = +44 → traveling east
+        lon_delta = curr_lon - prev_lon
+        is_eastward = lon_delta > 0.0
+        time_zone_crossings = abs(lon_delta) / 15.0  # ~15° per hour
+        if is_eastward and off_days == 0:
+            # Same-day eastward travel: harder on the body
+            direction_penalty = -float(np.clip(0.020 * time_zone_crossings, 0.0, 0.06))
+        elif is_eastward and off_days == 1:
+            direction_penalty = -float(np.clip(0.010 * time_zone_crossings, 0.0, 0.04))
+        # Westward travel is generally easier (gaining hours); apply a very small boost
+        elif not is_eastward and off_days == 0 and travel_miles > 1000:
+            direction_penalty = float(np.clip(0.008 * time_zone_crossings, 0.0, 0.02))
+    score += direction_penalty
+
     return {
         'off_days': int(off_days),
         'travel_miles': float(travel_miles),
-        'score': float(np.clip(score, -0.20, 0.10)),
+        'direction_penalty': float(direction_penalty),
+        'score': float(np.clip(score, -0.24, 0.10)),
         'previous_game_found': True,
     }
 
@@ -2025,8 +2137,162 @@ def weather_adjustments(weather):
     total_adj = (0.02 * ((temp_f - 72.0) / 5.0)) + (0.035 * wind_mph * wind_out_in) - (0.10 * (precip_prob / 100.0))
     return {'total_adj': float(np.clip(total_adj, -0.75, 0.75)), 'home_edge_adj': float(np.clip(0.01 * wind_out_in, -0.03, 0.03))}
 
+
+def fetch_umpire_for_game(client, game_pk):
+    """Fetch the home-plate umpire name for a scheduled game via the MLB boxscore endpoint.
+    Returns the umpire name string or None if unavailable."""
+    if not game_pk:
+        return None
+    try:
+        url = STATSAPI_GAME_OFFICIALS_URL.format(game_pk=int(game_pk))
+        payload = client.get_json(url, timeout=15)
+        officials = payload.get('officials') or []
+        for official in officials:
+            official_type = str((official.get('officialType') or '')).lower()
+            if 'home plate' in official_type or 'hp' in official_type or official_type == 'home_plate':
+                person = official.get('official') or {}
+                name = canonical_player_name(person.get('fullName') or person.get('name'))
+                if name:
+                    return name
+    except Exception:
+        pass
+    return None
+
+
+def umpire_total_adjustment(umpire_name, umpire_cache):
+    """Return a totals adjustment (runs above/below average) based on umpire calling tendencies.
+
+    The cache stores per-umpire stats with key 'runs_per_game_vs_avg' (positive = more runs
+    than league average, negative = fewer runs / tighter zone).  Falls back to 0.0 for unknown
+    umpires.  Adjustment is capped at ±0.40 runs to prevent outsized influence.
+    """
+    if not umpire_name or not umpire_cache:
+        return {'umpire_name': umpire_name, 'total_adj': 0.0, 'source': 'unknown'}
+    key = str(umpire_name).strip().lower()
+    entry = umpire_cache.get(key) or umpire_cache.get(umpire_name)
+    if not entry:
+        return {'umpire_name': umpire_name, 'total_adj': 0.0, 'source': 'unknown'}
+    raw_adj = finite(entry.get('runs_per_game_vs_avg'), 0.0)
+    sample_games = finite(entry.get('sample_games'), 0.0)
+    # Shrink toward zero for small samples (< 50 games = high uncertainty)
+    reliability = float(np.clip(sample_games / 80.0, 0.0, 1.0))
+    adjusted = raw_adj * reliability
+    return {
+        'umpire_name': umpire_name,
+        'total_adj': float(np.clip(adjusted, -0.40, 0.40)),
+        'raw_adj': raw_adj,
+        'sample_games': int(sample_games),
+        'reliability': reliability,
+        'source': 'cache',
+    }
+
+
+def refresh_umpire_cache_from_savant(client, umpire_cache, season=None):
+    """Placeholder: Baseball Savant's Statcast CSV export does not support umpire-level
+    aggregation via the group_by=name_umpire parameter — it returns raw pitch rows without
+    an umpire_name column.  This function is a no-op until a valid umpire stats source
+    is integrated (e.g., a manual CSV upload or a dedicated umpire leaderboard endpoint).
+
+    The cache can be populated manually: add entries keyed by lowercase umpire name with
+    the schema: {'umpire_name': str, 'runs_per_game_vs_avg': float, 'sample_games': int}.
+    """
+    return umpire_cache
+
+    # --- dead code preserved for reference when a real data source is found ---
+    target_season = int(season or SEASON)
+    try:
+        params = {
+            'all': 'true',
+            'hfSea': f'{target_season}|',
+            'player_type': 'pitcher',
+            'group_by': 'name_umpire',
+            'sort_col': 'pitches',
+            'sort_order': 'desc',
+            'min_pitches': 100,
+            'type': 'details',
+        }
+        raw = client.get_text(SAVANT_STATCAST_CSV_URL, params=params, timeout=90)
+        df = pd.read_csv(StringIO(raw), low_memory=False)
+    except Exception:
+        return umpire_cache
+
+    needed = {'umpire_name', 'p_called_strike', 'p_ball'}
+    if not needed.issubset(set(df.columns)):
+        return umpire_cache
+
+    try:
+        df['p_called_strike'] = pd.to_numeric(df['p_called_strike'], errors='coerce')
+        df['p_ball'] = pd.to_numeric(df['p_ball'], errors='coerce')
+        df['pitches'] = pd.to_numeric(df.get('pitches'), errors='coerce').fillna(0)
+        league_k_rate = float(df['p_called_strike'].mean()) if df['p_called_strike'].notna().any() else 0.17
+        league_bb_rate = float(df['p_ball'].mean()) if df['p_ball'].notna().any() else 0.35
+        updated = dict(umpire_cache)
+        for _, row in df.iterrows():
+            name = canonical_player_name(row.get('umpire_name'))
+            if not name:
+                continue
+            k_rate = finite(row.get('p_called_strike'), league_k_rate)
+            bb_rate = finite(row.get('p_ball'), league_bb_rate)
+            sample = int(finite(row.get('pitches'), 0) / 30)  # ~30 pitches per game
+            # Strikeout rate above avg → fewer baserunners → fewer runs (negative adj)
+            # Ball rate above avg → more walks → more runs (positive adj)
+            k_delta = k_rate - league_k_rate
+            bb_delta = bb_rate - league_bb_rate
+            runs_adj = float(np.clip((-4.0 * k_delta) + (3.5 * bb_delta), -0.50, 0.50))
+            key = name.strip().lower()
+            updated[key] = {
+                'umpire_name': name,
+                'runs_per_game_vs_avg': runs_adj,
+                'k_rate': k_rate,
+                'bb_rate': bb_rate,
+                'k_rate_vs_avg': k_delta,
+                'bb_rate_vs_avg': bb_delta,
+                'sample_games': max(sample, int(updated.get(key, {}).get('sample_games', 0))),
+                'season': target_season,
+            }
+        return updated
+    except Exception:
+        return umpire_cache
+
+
+def wilson_score_ci(successes, n, z=1.96):
+    """Wilson score 95% confidence interval for a proportion.
+    Returns (lower, upper) as floats, or (None, None) if n < 1."""
+    if n < 1:
+        return (None, None)
+    p_hat = float(successes) / float(n)
+    denom = 1.0 + (z * z / n)
+    center = (p_hat + z * z / (2 * n)) / denom
+    margin = z * math.sqrt(p_hat * (1.0 - p_hat) / n + z * z / (4 * n * n)) / denom
+    return (float(np.clip(center - margin, 0.0, 1.0)), float(np.clip(center + margin, 0.0, 1.0)))
+
+
+def bootstrap_mean_ci(values, n_boot=500, z=1.96, rng_seed=42):
+    """Bootstrap 95% CI for the mean of an array of values.
+    Uses a fixed seed for reproducibility.  Returns (lower, upper) or (None, None)."""
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    n = len(arr)
+    if n < 4:
+        return (None, None)
+    rng = np.random.default_rng(rng_seed)
+    boot_means = [float(rng.choice(arr, size=n, replace=True).mean()) for _ in range(n_boot)]
+    se = float(np.std(boot_means, ddof=1))
+    mean_val = float(arr.mean())
+    return (mean_val - z * se, mean_val + z * se)
+
+
 def build_validation_summary(backtest_df):
-    summary = {'games': 0, 'oos_games': 0, 'log_loss': None, 'accuracy': None, 'total_mae': None, 'total_rmse': None, 'margin_mae': None, 'margin_rmse': None, 'date_span': 'N/A', 'oos_span': 'N/A'}
+    summary = {
+        'games': 0, 'oos_games': 0,
+        'log_loss': None, 'log_loss_ci': (None, None),
+        'accuracy': None, 'accuracy_ci': (None, None),
+        'total_mae': None, 'total_mae_ci': (None, None),
+        'total_rmse': None, 'total_rmse_ci': (None, None),
+        'margin_mae': None, 'margin_mae_ci': (None, None),
+        'margin_rmse': None, 'margin_rmse_ci': (None, None),
+        'date_span': 'N/A', 'oos_span': 'N/A',
+    }
     if backtest_df is None or backtest_df.empty:
         return summary
     work = backtest_df.copy()
@@ -2044,24 +2310,35 @@ def build_validation_summary(backtest_df):
     valid = (~y.isna()) & (~p.isna())
     if valid.any():
         yv, pv = y[valid].astype(int), p[valid].astype(float)
-        summary['log_loss'] = float((-(yv * np.log(pv)) - ((1 - yv) * np.log(1.0 - pv))).mean())
-        summary['accuracy'] = float(np.mean((pv >= 0.5).astype(int) == yv))
+        per_game_ll = -(yv * np.log(pv)) - ((1 - yv) * np.log(1.0 - pv))
+        summary['log_loss'] = float(per_game_ll.mean())
+        summary['log_loss_ci'] = bootstrap_mean_ci(per_game_ll.values)
+        correct = (pv >= 0.5).astype(int) == yv
+        summary['accuracy'] = float(correct.mean())
+        summary['accuracy_ci'] = wilson_score_ci(int(correct.sum()), len(correct))
     actual_total = pd.to_numeric(oos.get('home_score'), errors='coerce') + pd.to_numeric(oos.get('away_score'), errors='coerce')
     predicted_total = pd.to_numeric(oos.get('projected_total'), errors='coerce')
     total_valid = (~actual_total.isna()) & (~predicted_total.isna())
     if total_valid.any():
         total_error = actual_total[total_valid] - predicted_total[total_valid]
         summary['total_mae'] = float(np.mean(np.abs(total_error)))
+        summary['total_mae_ci'] = bootstrap_mean_ci(np.abs(total_error).values)
         summary['total_rmse'] = float(np.sqrt(np.mean(np.square(total_error))))
+        summary['total_rmse_ci'] = bootstrap_mean_ci(np.square(total_error).values)
     actual_margin = pd.to_numeric(oos.get('home_score'), errors='coerce') - pd.to_numeric(oos.get('away_score'), errors='coerce')
     predicted_margin = pd.to_numeric(oos.get('projected_margin'), errors='coerce')
     margin_valid = (~actual_margin.isna()) & (~predicted_margin.isna())
     if margin_valid.any():
         margin_error = actual_margin[margin_valid] - predicted_margin[margin_valid]
         summary['margin_mae'] = float(np.mean(np.abs(margin_error)))
+        summary['margin_mae_ci'] = bootstrap_mean_ci(np.abs(margin_error).values)
         summary['margin_rmse'] = float(np.sqrt(np.mean(np.square(margin_error))))
+        summary['margin_rmse_ci'] = bootstrap_mean_ci(np.square(margin_error).values)
     summary['games'], summary['oos_games'] = int(len(work)), int(len(oos))
-    summary['date_span'], summary['oos_span'] = f"{unique_dates[0].isoformat()} to {unique_dates[-1].isoformat()}", f"{sorted(oos['date'].unique())[0].isoformat()} to {sorted(oos['date'].unique())[-1].isoformat()}"
+    summary['date_span'], summary['oos_span'] = (
+        f"{unique_dates[0].isoformat()} to {unique_dates[-1].isoformat()}",
+        f"{sorted(oos['date'].unique())[0].isoformat()} to {sorted(oos['date'].unique())[-1].isoformat()}",
+    )
     return summary
 
 
@@ -2069,12 +2346,12 @@ def build_live_validation_summary(archive_df, phase_filter=None):
     summary = {
         'games': 0,
         'settled_days': 0,
-        'log_loss': None,
-        'accuracy': None,
-        'total_mae': None,
-        'total_rmse': None,
-        'margin_mae': None,
-        'margin_rmse': None,
+        'log_loss': None, 'log_loss_ci': (None, None),
+        'accuracy': None, 'accuracy_ci': (None, None),
+        'total_mae': None, 'total_mae_ci': (None, None),
+        'total_rmse': None, 'total_rmse_ci': (None, None),
+        'margin_mae': None, 'margin_mae_ci': (None, None),
+        'margin_rmse': None, 'margin_rmse_ci': (None, None),
         'date_span': 'N/A',
         'latest_settled_date': None,
     }
@@ -2103,25 +2380,130 @@ def build_live_validation_summary(archive_df, phase_filter=None):
     p = work['p_home'].astype(float)
     summary['games'] = int(len(work))
     summary['settled_days'] = int(work['report_date'].nunique())
-    summary['log_loss'] = float((-(y * np.log(p)) - ((1 - y) * np.log(1.0 - p))).mean())
-    summary['accuracy'] = float(((p >= 0.5).astype(int) == y).mean())
+    per_game_ll = -(y * np.log(p)) - ((1 - y) * np.log(1.0 - p))
+    summary['log_loss'] = float(per_game_ll.mean())
+    summary['log_loss_ci'] = bootstrap_mean_ci(per_game_ll.values)
+    correct = (p >= 0.5).astype(int) == y
+    summary['accuracy'] = float(correct.mean())
+    summary['accuracy_ci'] = wilson_score_ci(int(correct.sum()), len(correct))
     if {'actual_total', 'projected_total'}.issubset(work.columns):
         total_valid = work.dropna(subset=['actual_total', 'projected_total']).copy()
         if not total_valid.empty:
             total_error = total_valid['actual_total'].astype(float) - total_valid['projected_total'].astype(float)
             summary['total_mae'] = float(np.mean(np.abs(total_error)))
+            summary['total_mae_ci'] = bootstrap_mean_ci(np.abs(total_error).values)
             summary['total_rmse'] = float(np.sqrt(np.mean(np.square(total_error))))
+            summary['total_rmse_ci'] = bootstrap_mean_ci(np.square(total_error).values)
     if {'actual_margin', 'projected_margin'}.issubset(work.columns):
         margin_valid = work.dropna(subset=['actual_margin', 'projected_margin']).copy()
         if not margin_valid.empty:
             margin_error = margin_valid['actual_margin'].astype(float) - margin_valid['projected_margin'].astype(float)
             summary['margin_mae'] = float(np.mean(np.abs(margin_error)))
+            summary['margin_mae_ci'] = bootstrap_mean_ci(np.abs(margin_error).values)
             summary['margin_rmse'] = float(np.sqrt(np.mean(np.square(margin_error))))
+            summary['margin_rmse_ci'] = bootstrap_mean_ci(np.square(margin_error).values)
     date_values = sorted(work['report_date'].unique().tolist())
     if date_values:
         summary['date_span'] = f"{date_values[0].isoformat()} to {date_values[-1].isoformat()}"
         summary['latest_settled_date'] = date_values[-1].isoformat()
     return summary
+
+
+def build_walkforward_cv_summary(backtest_df, min_train_days=8, test_window_days=3):
+    """Walk-forward (expanding-window) time-series cross-validation.
+
+    Splits the backtest log by date into sequential folds.  Each fold trains on all data
+    up to date T and evaluates on the next `test_window_days` of data.  Reports mean and
+    95% CI for log loss and total RMSE across all folds.
+
+    Returns a dict with:
+      - folds: list of per-fold dicts (train_games, test_games, log_loss, total_rmse)
+      - mean_log_loss, log_loss_ci
+      - mean_total_rmse, total_rmse_ci
+      - mean_accuracy, accuracy_ci
+      - fold_count
+    """
+    result = {
+        'fold_count': 0,
+        'folds': [],
+        'mean_log_loss': None, 'log_loss_ci': (None, None),
+        'mean_total_rmse': None, 'total_rmse_ci': (None, None),
+        'mean_accuracy': None, 'accuracy_ci': (None, None),
+        'note': '',
+    }
+    if backtest_df is None or backtest_df.empty:
+        result['note'] = 'No backtest data available.'
+        return result
+    work = backtest_df.copy()
+    work['date'] = pd.to_datetime(work.get('date'), errors='coerce').dt.date
+    work = work[work['date'].notna()].copy()
+    if work.empty:
+        result['note'] = 'No dated rows in backtest log.'
+        return result
+    work['p_home'] = pd.to_numeric(work.get('p_home'), errors='coerce').clip(1e-6, 1.0 - 1e-6)
+    work['y_home'] = pd.to_numeric(work.get('y_home'), errors='coerce')
+    work = work.dropna(subset=['date', 'p_home', 'y_home']).copy()
+    unique_dates = sorted(work['date'].unique())
+    if len(unique_dates) < min_train_days + test_window_days:
+        result['note'] = f'Too few dates ({len(unique_dates)}) for walk-forward CV (need {min_train_days + test_window_days}).'
+        return result
+
+    folds = []
+    i = min_train_days
+    while i < len(unique_dates):
+        train_dates = set(unique_dates[:i])
+        test_dates = set(unique_dates[i:i + test_window_days])
+        train_df = work[work['date'].isin(train_dates)]
+        test_df = work[work['date'].isin(test_dates)]
+        if len(test_df) < 2:
+            i += test_window_days
+            continue
+        y_test = test_df['y_home'].astype(int)
+        p_test = test_df['p_home'].astype(float)
+        fold_ll = float((-(y_test * np.log(p_test)) - ((1 - y_test) * np.log(1.0 - p_test))).mean())
+        fold_acc = float(((p_test >= 0.5).astype(int) == y_test).mean())
+        fold_rmse = None
+        if {'projected_total', 'home_score', 'away_score'}.issubset(test_df.columns):
+            actual_total = pd.to_numeric(test_df['home_score'], errors='coerce') + pd.to_numeric(test_df['away_score'], errors='coerce')
+            pred_total = pd.to_numeric(test_df['projected_total'], errors='coerce')
+            tv = (~actual_total.isna()) & (~pred_total.isna())
+            if tv.any():
+                fold_rmse = float(np.sqrt(np.mean(np.square(actual_total[tv] - pred_total[tv]))))
+        folds.append({
+            'train_games': int(len(train_df)),
+            'test_games': int(len(test_df)),
+            'test_date_start': unique_dates[i].isoformat(),
+            'log_loss': fold_ll,
+            'accuracy': fold_acc,
+            'total_rmse': fold_rmse,
+        })
+        i += test_window_days
+
+    if not folds:
+        result['note'] = 'No valid folds produced.'
+        return result
+
+    ll_values = [f['log_loss'] for f in folds]
+    acc_values = [f['accuracy'] for f in folds]
+    rmse_values = [f['total_rmse'] for f in folds if f['total_rmse'] is not None]
+
+    result['fold_count'] = len(folds)
+    result['folds'] = folds
+    result['mean_log_loss'] = float(np.mean(ll_values))
+    result['log_loss_ci'] = bootstrap_mean_ci(ll_values)
+    result['mean_accuracy'] = float(np.mean(acc_values))
+    result['accuracy_ci'] = wilson_score_ci(
+        sum(int(round(f['accuracy'] * f['test_games'])) for f in folds),
+        sum(f['test_games'] for f in folds),
+    )
+    if rmse_values:
+        result['mean_total_rmse'] = float(np.mean(rmse_values))
+        result['total_rmse_ci'] = bootstrap_mean_ci(rmse_values)
+    result['note'] = (
+        f"{len(folds)} folds | train up to {unique_dates[min_train_days - 1].isoformat()} → "
+        f"test through {unique_dates[-1].isoformat()}"
+    )
+    return result
 
 
 def build_live_regular_calibration_surfaces(archive_df, phase_filter=None):
@@ -3271,7 +3653,7 @@ def build_prediction_explainer(prediction, market_type):
         'matchup_label': f"{game.get('away_team')} @ {game.get('home_team')}",
     }
 
-def predict_game(game, phase, weights, state, strengths, current_pitchers, prior_pitchers, current_batters, prior_batters, bullpen_profiles, park_cache, client, venue_cache, margin_sigma, lineup_counts_override=None):
+def predict_game(game, phase, weights, state, strengths, current_pitchers, prior_pitchers, current_batters, prior_batters, bullpen_profiles, park_cache, client, venue_cache, margin_sigma, lineup_counts_override=None, umpire_cache=None):
     strength_index = strengths.set_index('team') if strengths is not None and not strengths.empty else pd.DataFrame().set_index(pd.Index([], name='team'))
     away_row = strength_index.loc[game['away_team']].to_dict() if game['away_team'] in strength_index.index else {}
     home_row = strength_index.loc[game['home_team']].to_dict() if game['home_team'] in strength_index.index else {}
@@ -3306,6 +3688,10 @@ def predict_game(game, phase, weights, state, strengths, current_pitchers, prior
     weather = fetch_weather_context(client, game, venue_meta)
     weather_adj = weather_adjustments(weather)
 
+    # Umpire zone adjustment — fetch HP ump from boxscore, look up run tendency from cache
+    hp_umpire_name = fetch_umpire_for_game(client, game.get('game_pk'))
+    ump_adj = umpire_total_adjustment(hp_umpire_name, umpire_cache or {})
+
     lineup_ctx = lineup_quality_context(game['game_pk'], away_row, home_row, current_batters, prior_batters, client, lineup_counts_override=lineup_counts_override)
     lineups = lineup_ctx.get('counts') or {'away': 0, 'home': 0}
     away_lineup_ctx = lineup_ctx.get('away') or {}
@@ -3326,7 +3712,19 @@ def predict_game(game, phase, weights, state, strengths, current_pitchers, prior
     context_feature_mult = 0.0 if phase == 'spring' else 1.0
     schedule_component = context_feature_mult * (finite(home_schedule.get('score'), 0.0) - finite(away_schedule.get('score'), 0.0))
     defense_component = context_feature_mult * (0.09 * (home_def - away_def))
-    x_context_core = schedule_component + defense_component
+
+    # Injury / transaction wire: fetch recent IL moves and fold net impact into context
+    target_date_local = game['scheduled_utc'].astimezone(LOCAL_TZ).date() if game.get('scheduled_utc') else today_local()
+    away_team_id = game.get('away_team_id')
+    home_team_id = game.get('home_team_id')
+    away_injury_ctx = fetch_team_injury_transactions(client, away_team_id, target_date_local) if away_team_id else {'net_il_impact': 0.0}
+    home_injury_ctx = fetch_team_injury_transactions(client, home_team_id, target_date_local) if home_team_id else {'net_il_impact': 0.0}
+    # Positive net_il_impact = more activations (boost to that team's offense)
+    # Incorporate as a small context adjustment scaled by context_feature_mult
+    injury_component = context_feature_mult * (
+        finite(home_injury_ctx.get('net_il_impact'), 0.0) - finite(away_injury_ctx.get('net_il_impact'), 0.0)
+    )
+    x_context_core = schedule_component + defense_component + injury_component
 
     x_off = home_off - away_off
     x_starter = (finite(home_starter.get('score'), 0.0) * finite(home_starter_workload.get('starter_share'), 0.55)) - (finite(away_starter.get('score'), 0.0) * finite(away_starter_workload.get('starter_share'), 0.55))
@@ -3335,6 +3733,18 @@ def predict_game(game, phase, weights, state, strengths, current_pitchers, prior
     x_weather = finite(weather_adj['home_edge_adj'], 0.0)
     x_short_start = finite(away_starter_workload.get('short_start_risk'), 0.0) - finite(home_starter_workload.get('short_start_risk'), 0.0)
     x_tto = finite(away_starter_workload.get('tto_risk'), 0.0) - finite(home_starter_workload.get('tto_risk'), 0.0)
+
+    # Offense × starter quality interaction: captures non-additive compounding when a
+    # strong offense faces a weak starter (or vice-versa).  The sign convention is:
+    # positive = home team benefits (strong home offense vs weak away starter, or
+    # home has elite starter facing poor away offense).
+    home_starter_score = finite(home_starter.get('score'), 0.0) * finite(home_starter_workload.get('starter_share'), 0.55)
+    away_starter_score = finite(away_starter.get('score'), 0.0) * finite(away_starter_workload.get('starter_share'), 0.55)
+    # Home offense vs away starter: if home_off > 0 (strong offense) and away starter < 0 (weak), compound amplifies
+    home_off_vs_away_sp = home_off * max(0.0, -away_starter_score)
+    # Away offense vs home starter: if away_off > 0 and home starter < 0, compound benefits away team (hurts home)
+    away_off_vs_home_sp = away_off * max(0.0, -home_starter_score)
+    x_off_starter_cross = float(np.clip(home_off_vs_away_sp - away_off_vs_home_sp, -1.20, 1.20))
 
     home_bridge = (
         finite(home_starter_workload.get('short_start_risk'), 0.0) * max(0.0, -home_bullpen)
@@ -3353,9 +3763,12 @@ def predict_game(game, phase, weights, state, strengths, current_pitchers, prior
     x_context_no_lineup = x_context_core + (0.42 * interaction_core)
     x_context_full_lineup = x_context_core + x_lineup + (0.42 * (interaction_core + interaction_lineup))
 
-    logit_no_lineup = (weights['w_off'] * x_off) + (weights['w_starter'] * x_starter) + (weights['w_bullpen'] * x_bullpen) + (weights['w_park'] * x_park) + (weights['w_weather'] * x_weather) + (weights['w_context'] * x_context_no_lineup) + weights['home_field']
-    logit_full_lineup = (weights['w_off'] * x_off) + (weights['w_starter'] * x_starter) + (weights['w_bullpen'] * x_bullpen) + (weights['w_park'] * x_park) + (weights['w_weather'] * x_weather) + (weights['w_context'] * x_context_full_lineup) + weights['home_field']
-    logit = (weights['w_off'] * x_off) + (weights['w_starter'] * x_starter) + (weights['w_bullpen'] * x_bullpen) + (weights['w_park'] * x_park) + (weights['w_weather'] * x_weather) + (weights['w_context'] * x_context) + weights['home_field']
+    # w_cross: weight for the offense×starter interaction term.  Loaded from state if available,
+    # defaulting to 0.04 — small enough not to dominate but large enough to influence close games.
+    w_cross = finite(weights.get('w_cross', 0.04), 0.04)
+    logit_no_lineup = (weights['w_off'] * x_off) + (weights['w_starter'] * x_starter) + (weights['w_bullpen'] * x_bullpen) + (weights['w_park'] * x_park) + (weights['w_weather'] * x_weather) + (weights['w_context'] * x_context_no_lineup) + (w_cross * x_off_starter_cross) + weights['home_field']
+    logit_full_lineup = (weights['w_off'] * x_off) + (weights['w_starter'] * x_starter) + (weights['w_bullpen'] * x_bullpen) + (weights['w_park'] * x_park) + (weights['w_weather'] * x_weather) + (weights['w_context'] * x_context_full_lineup) + (w_cross * x_off_starter_cross) + weights['home_field']
+    logit = (weights['w_off'] * x_off) + (weights['w_starter'] * x_starter) + (weights['w_bullpen'] * x_bullpen) + (weights['w_park'] * x_park) + (weights['w_weather'] * x_weather) + (weights['w_context'] * x_context) + (w_cross * x_off_starter_cross) + weights['home_field']
 
     p_home_raw_no_lineup = sigmoid(logit_no_lineup)
     p_home_raw_full_lineup = sigmoid(logit_full_lineup)
@@ -3382,7 +3795,7 @@ def predict_game(game, phase, weights, state, strengths, current_pitchers, prior
         + (finite(total_params.get('shared_env_uncertainty_coef'), 0.06) * starter_uncertainty)
     )
     shared_env = float(np.clip(shared_env, 0.0, finite(total_params.get('env_cap'), 1.0)))
-    shared_total_adj = finite(park_history['total_adj'], 0.0) + finite(park_static['total_adj'], 0.0) + finite(weather_adj['total_adj'], 0.0) + shared_env
+    shared_total_adj = finite(park_history['total_adj'], 0.0) + finite(park_static['total_adj'], 0.0) + finite(weather_adj['total_adj'], 0.0) + finite(ump_adj.get('total_adj'), 0.0) + shared_env
     base = finite(total_params.get('base_runs'), LEAGUE_BASE_RUNS.get(phase, 4.6))
     away_runs_raw = base + (finite(total_params.get('offense_coef'), 0.65) * away_off) - (finite(total_params.get('starter_coef'), 0.84) * finite(home_starter.get('score'), 0.0) * finite(home_starter_workload.get('starter_share'), 0.55)) - (finite(total_params.get('bullpen_coef'), 0.35) * home_bullpen * finite(home_starter_workload.get('bullpen_share'), 0.45)) + (finite(total_params.get('shared_total_coef'), 0.38) * shared_total_adj) + (finite(total_params.get('schedule_coef'), 0.05) * context_feature_mult * finite(away_schedule.get('score'), 0.0)) - (finite(total_params.get('defense_coef'), 0.09) * context_feature_mult * home_def) + (finite(total_params.get('lineup_coef'), 0.11) * lineup_multiplier * away_lineup_bonus) + (finite(total_params.get('bridge_coef'), 0.09) * home_bridge) + (0.06 * finite(home_starter_workload.get('tto_risk'), 0.0)) - (finite(total_params.get('availability_coef'), 0.03) * max(0.0, home_bullpen_availability) * finite(home_starter_workload.get('bullpen_share'), 0.45)) - (0.02 * max(0.0, home_leverage_availability))
     home_runs_raw = base + (finite(total_params.get('offense_coef'), 0.65) * home_off) - (finite(total_params.get('starter_coef'), 0.84) * finite(away_starter.get('score'), 0.0) * finite(away_starter_workload.get('starter_share'), 0.55)) - (finite(total_params.get('bullpen_coef'), 0.35) * away_bullpen * finite(away_starter_workload.get('bullpen_share'), 0.45)) + (finite(total_params.get('shared_total_coef'), 0.38) * shared_total_adj) + (finite(total_params.get('schedule_coef'), 0.05) * context_feature_mult * finite(home_schedule.get('score'), 0.0)) - (finite(total_params.get('defense_coef'), 0.09) * context_feature_mult * away_def) + (finite(total_params.get('lineup_coef'), 0.11) * lineup_multiplier * home_lineup_bonus) + (finite(total_params.get('bridge_coef'), 0.09) * away_bridge) + (0.06 * finite(away_starter_workload.get('tto_risk'), 0.0)) - (finite(total_params.get('availability_coef'), 0.03) * max(0.0, away_bullpen_availability) * finite(away_starter_workload.get('bullpen_share'), 0.45)) - (0.02 * max(0.0, away_leverage_availability))
@@ -3436,6 +3849,7 @@ def predict_game(game, phase, weights, state, strengths, current_pitchers, prior
             'margin_model': margin_model, 'margin_simple': margin_simple, 'margin_shrink_alpha': margin_shrink_alpha,
             'away_off_base': away_off_base, 'home_off_base': home_off_base, 'away_off_matchup': away_matchup, 'home_off_matchup': home_matchup,
             'away_defense': away_def, 'home_defense': home_def, 'away_schedule': away_schedule, 'home_schedule': home_schedule,
+            'away_injury_ctx': away_injury_ctx, 'home_injury_ctx': home_injury_ctx,
             'context_components': {
                 'lineup_count': lineup_count_component,
                 'lineup_quality': lineup_quality_component,
@@ -3449,7 +3863,8 @@ def predict_game(game, phase, weights, state, strengths, current_pitchers, prior
                 'interaction_lineup': interaction_lineup,
             },
             'x_lineup': x_lineup, 'x_context_core': x_context_core, 'x_interaction': x_interaction,
-            'x_off': x_off, 'x_starter': x_starter, 'x_bullpen': x_bullpen, 'x_park': x_park, 'x_weather': x_weather, 'x_context': x_context, 'venue_meta': venue_meta,
+            'x_off': x_off, 'x_starter': x_starter, 'x_bullpen': x_bullpen, 'x_park': x_park, 'x_weather': x_weather, 'x_context': x_context, 'x_off_starter_cross': x_off_starter_cross, 'venue_meta': venue_meta,
+            'umpire': ump_adj,
         },
     }
 def manual_market_warning(report_date):
@@ -4370,6 +4785,8 @@ def main():
         warnings.append(f"Backfilled {archive_backfilled} archived live prediction row(s) with starter/bullpen attribution context.")
     backtest_log = load_validation_log()
     model_state, shrink_profile = fit_probability_shrinkage_profile(model_state, backtest_log)
+    model_state, total_calib_profile = fit_total_calibration_profile(model_state, backtest_log)
+    model_state, total_shrink_profile = fit_total_shrinkage_profile(model_state, backtest_log)
     model_state, total_sigma_profile = fit_total_sigma_profile(model_state, backtest_log)
     model_state, margin_shrink_profile = fit_margin_shrinkage_profile(model_state, backtest_log)
     model_state, lineup_profile = update_lineup_earn_back_state(model_state, live_archive)
@@ -4468,6 +4885,15 @@ def main():
     if market_map:
         warnings.append(f"Current sportsbook consensus loaded for {len(market_map)} game(s).")
 
+    umpire_cache = load_umpire_stats_cache()
+    umpire_refreshed_date = str(umpire_cache.get('_refreshed_date', ''))
+    if umpire_refreshed_date != report_date.isoformat():
+        umpire_cache = refresh_umpire_cache_from_savant(client, umpire_cache)
+        umpire_cache['_refreshed_date'] = report_date.isoformat()
+        save_umpire_stats_cache(umpire_cache)
+    umpire_known = sum(1 for k in umpire_cache if not k.startswith('_'))
+    warnings.append(f"Umpire cache: {umpire_known} umpire(s) loaded{'' if umpire_known else ' — cache empty, adjustments will be 0'}.")
+
     season_start, pregame_end, game_types = dt.date(report_date.year, 1, 1), report_date, ('S|' if phase == 'spring' else 'R|')
     current_batter_raw = savant_statcast_csv(client, 'batter', report_date.year, season_start, pregame_end, game_types)
     batter_raw_30 = savant_statcast_csv(client, 'batter', report_date.year, report_date - dt.timedelta(days=30), pregame_end, game_types)
@@ -4507,6 +4933,7 @@ def main():
             client,
             venue_cache,
             margin_sigma,
+            umpire_cache=umpire_cache,
         )
         for game in games
     ]

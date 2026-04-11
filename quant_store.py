@@ -273,33 +273,33 @@ def _ensure_quant_views(con) -> None:
         """
         CREATE OR REPLACE VIEW rolling_kpi_windows AS
         SELECT report_date, phase, 'Trailing 3 runs' AS window_label,
-               AVG(live_validation_log_loss) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS live_validation_log_loss,
-               AVG(live_validation_accuracy) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS live_validation_accuracy,
-               AVG(live_validation_total_rmse) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS live_validation_total_rmse,
-               AVG(live_validation_margin_rmse) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS live_validation_margin_rmse,
-               AVG(market_proof_avg_clv) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS market_proof_avg_clv,
-               AVG(market_proof_roi) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS market_proof_roi,
-               AVG(target_progress_pct) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS target_progress_pct
+               AVG(TRY_CAST(live_validation_log_loss AS DOUBLE)) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS live_validation_log_loss,
+               AVG(TRY_CAST(live_validation_accuracy AS DOUBLE)) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS live_validation_accuracy,
+               AVG(TRY_CAST(live_validation_total_rmse AS DOUBLE)) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS live_validation_total_rmse,
+               AVG(TRY_CAST(live_validation_margin_rmse AS DOUBLE)) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS live_validation_margin_rmse,
+               AVG(TRY_CAST(market_proof_avg_clv AS DOUBLE)) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS market_proof_avg_clv,
+               AVG(TRY_CAST(market_proof_roi AS DOUBLE)) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS market_proof_roi,
+               AVG(TRY_CAST(target_progress_pct AS DOUBLE)) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS target_progress_pct
         FROM daily_kpi_snapshot_daily
         UNION ALL
         SELECT report_date, phase, 'Trailing 7 runs' AS window_label,
-               AVG(live_validation_log_loss) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS live_validation_log_loss,
-               AVG(live_validation_accuracy) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS live_validation_accuracy,
-               AVG(live_validation_total_rmse) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS live_validation_total_rmse,
-               AVG(live_validation_margin_rmse) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS live_validation_margin_rmse,
-               AVG(market_proof_avg_clv) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS market_proof_avg_clv,
-               AVG(market_proof_roi) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS market_proof_roi,
-               AVG(target_progress_pct) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS target_progress_pct
+               AVG(TRY_CAST(live_validation_log_loss AS DOUBLE)) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS live_validation_log_loss,
+               AVG(TRY_CAST(live_validation_accuracy AS DOUBLE)) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS live_validation_accuracy,
+               AVG(TRY_CAST(live_validation_total_rmse AS DOUBLE)) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS live_validation_total_rmse,
+               AVG(TRY_CAST(live_validation_margin_rmse AS DOUBLE)) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS live_validation_margin_rmse,
+               AVG(TRY_CAST(market_proof_avg_clv AS DOUBLE)) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS market_proof_avg_clv,
+               AVG(TRY_CAST(market_proof_roi AS DOUBLE)) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS market_proof_roi,
+               AVG(TRY_CAST(target_progress_pct AS DOUBLE)) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS target_progress_pct
         FROM daily_kpi_snapshot_daily
         UNION ALL
         SELECT report_date, phase, 'Trailing 14 runs' AS window_label,
-               AVG(live_validation_log_loss) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 13 PRECEDING AND CURRENT ROW) AS live_validation_log_loss,
-               AVG(live_validation_accuracy) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 13 PRECEDING AND CURRENT ROW) AS live_validation_accuracy,
-               AVG(live_validation_total_rmse) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 13 PRECEDING AND CURRENT ROW) AS live_validation_total_rmse,
-               AVG(live_validation_margin_rmse) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 13 PRECEDING AND CURRENT ROW) AS live_validation_margin_rmse,
-               AVG(market_proof_avg_clv) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 13 PRECEDING AND CURRENT ROW) AS market_proof_avg_clv,
-               AVG(market_proof_roi) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 13 PRECEDING AND CURRENT ROW) AS market_proof_roi,
-               AVG(target_progress_pct) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 13 PRECEDING AND CURRENT ROW) AS target_progress_pct
+               AVG(TRY_CAST(live_validation_log_loss AS DOUBLE)) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 13 PRECEDING AND CURRENT ROW) AS live_validation_log_loss,
+               AVG(TRY_CAST(live_validation_accuracy AS DOUBLE)) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 13 PRECEDING AND CURRENT ROW) AS live_validation_accuracy,
+               AVG(TRY_CAST(live_validation_total_rmse AS DOUBLE)) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 13 PRECEDING AND CURRENT ROW) AS live_validation_total_rmse,
+               AVG(TRY_CAST(live_validation_margin_rmse AS DOUBLE)) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 13 PRECEDING AND CURRENT ROW) AS live_validation_margin_rmse,
+               AVG(TRY_CAST(market_proof_avg_clv AS DOUBLE)) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 13 PRECEDING AND CURRENT ROW) AS market_proof_avg_clv,
+               AVG(TRY_CAST(market_proof_roi AS DOUBLE)) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 13 PRECEDING AND CURRENT ROW) AS market_proof_roi,
+               AVG(TRY_CAST(target_progress_pct AS DOUBLE)) OVER (PARTITION BY phase ORDER BY report_date ROWS BETWEEN 13 PRECEDING AND CURRENT ROW) AS target_progress_pct
         FROM daily_kpi_snapshot_daily
         """
     )
@@ -1201,7 +1201,7 @@ def _market_policy_summary_fields(current_rows: pd.DataFrame, previous_rows: pd.
     for market_key, market_label in MARKET_POLICY_TYPES:
         prefix = f'market_policy_{market_key}'
         current_row = current[current['market_type'].astype(str).str.lower() == market_key]
-        previous_row = previous[previous['market_type'].astype(str).str.lower() == market_key]
+        previous_row = previous[previous['market_type'].astype(str).str.lower() == market_key] if 'market_type' in previous.columns else pd.DataFrame()
         row = current_row.iloc[0] if not current_row.empty else pd.Series(dtype=object)
         prev = previous_row.iloc[0] if not previous_row.empty else pd.Series(dtype=object)
 
