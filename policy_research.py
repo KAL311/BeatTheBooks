@@ -208,11 +208,28 @@ def apply_policy_to_recommendations(summary_row: Dict[str, Any], recommendations
         if policy_name == 'Flat':
             return 1.0, 'Keeps the allocator size as-is.'
         if policy_name == 'Fractional Kelly Proxy':
-            factor = clip_value((0.55 + (2.50 * ev) + (0.75 * edge) + (0.15 * action)) * (0.85 + (0.15 * corr)), 0.45, 1.35)
-            return factor, 'Scales up cleaner, higher-EV edges and scales down weaker ones.'
+            # True fractional Kelly (25% Kelly) sizing.
+            # Full Kelly fraction f* = EV / b, where b is win_profit per unit risked.
+            # For typical MLB near-even-money lines b ≈ 0.90.
+            # EV = b*p - (1-p), so full_kelly = EV / b.
+            # We use 25% Kelly for conservatism, then scale to a relative factor
+            # anchored so that a solid EV of 0.05 maps to factor ≈ 1.0.
+            b_estimate = max(0.80, 1.0 - ev * 0.5)  # slight downward adjust for favorite-heavy slates
+            full_kelly = ev / b_estimate if b_estimate > 1e-6 else 0.0
+            quarter_kelly = full_kelly * 0.25
+            # Normalize: quarter_kelly of 0.0125 → factor 1.0 (represents ~EV 0.04-0.05 range)
+            base_factor = 0.45 + (quarter_kelly / 0.0125) * 0.55
+            # Apply correlation and actionability scaling
+            factor = clip_value(base_factor * corr * (0.80 + (0.20 * action)), 0.45, 1.35)
+            return factor, f'25% Kelly: full_kelly={full_kelly:.3f}, factor={factor:.3f}'
+        # Risk-Capped Hybrid: true Kelly base with hard concentration drag
+        b_estimate = max(0.80, 1.0 - ev * 0.5)
+        full_kelly = ev / b_estimate if b_estimate > 1e-6 else 0.0
+        quarter_kelly = full_kelly * 0.25
+        base_factor = 0.50 + (quarter_kelly / 0.0125) * 0.50
         concentration_drag = clip_value(1.0 - (0.06 * same_game) - (0.05 * same_team), 0.70, 1.00)
-        factor = clip_value(min(0.60 + (2.20 * ev) + (0.60 * edge) + (0.10 * action), 1.10) * concentration_drag * (0.90 + (0.10 * corr)), 0.50, 1.10)
-        return factor, 'Uses a Kelly-like response but trims crowded game and team exposure harder.'
+        factor = clip_value(base_factor * concentration_drag * corr * (0.85 + (0.15 * action)), 0.50, 1.10)
+        return factor, f'Kelly-hybrid: full_kelly={full_kelly:.3f}, conc_drag={concentration_drag:.2f}, factor={factor:.3f}'
 
     policy_details = rec.apply(_policy_factor, axis=1, result_type='expand')
     rec['policy_factor'] = pd.to_numeric(policy_details[0], errors='coerce').fillna(1.0)
