@@ -2188,12 +2188,17 @@ def umpire_total_adjustment(umpire_name, umpire_cache):
 
 
 def refresh_umpire_cache_from_savant(client, umpire_cache, season=None):
-    """Pull umpire strike-zone stats from Baseball Savant for the current season and merge
-    into the local cache.  This enriches the cache with: runs_per_game_vs_avg, k_rate_vs_avg,
-    bb_rate_vs_avg, and sample_games derived from the Statcast pitch-level export.
+    """Placeholder: Baseball Savant's Statcast CSV export does not support umpire-level
+    aggregation via the group_by=name_umpire parameter — it returns raw pitch rows without
+    an umpire_name column.  This function is a no-op until a valid umpire stats source
+    is integrated (e.g., a manual CSV upload or a dedicated umpire leaderboard endpoint).
 
-    The function is best-effort — API failures leave the existing cache untouched.
+    The cache can be populated manually: add entries keyed by lowercase umpire name with
+    the schema: {'umpire_name': str, 'runs_per_game_vs_avg': float, 'sample_games': int}.
     """
+    return umpire_cache
+
+    # --- dead code preserved for reference when a real data source is found ---
     target_season = int(season or SEASON)
     try:
         params = {
@@ -4780,6 +4785,8 @@ def main():
         warnings.append(f"Backfilled {archive_backfilled} archived live prediction row(s) with starter/bullpen attribution context.")
     backtest_log = load_validation_log()
     model_state, shrink_profile = fit_probability_shrinkage_profile(model_state, backtest_log)
+    model_state, total_calib_profile = fit_total_calibration_profile(model_state, backtest_log)
+    model_state, total_shrink_profile = fit_total_shrinkage_profile(model_state, backtest_log)
     model_state, total_sigma_profile = fit_total_sigma_profile(model_state, backtest_log)
     model_state, margin_shrink_profile = fit_margin_shrinkage_profile(model_state, backtest_log)
     model_state, lineup_profile = update_lineup_earn_back_state(model_state, live_archive)
